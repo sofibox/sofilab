@@ -1,0 +1,75 @@
+# sofilab.conf.sample - SSH connection configuration template
+# Copy this file to sofilab.conf and customize with your server details
+
+# GLOBAL CONFIGURATION
+# These settings control logging and other global behaviors
+[global]
+log_dir="logs"                # Directory for log files (relative to script dir or absolute path)
+log_level="INFO"              # Logging level: DEBUG, INFO, WARN, ERROR
+enable_logging="true"         # Enable/disable logging: true or false
+max_log_size="10M"           # Maximum log file size before rotation (K/M/G suffix)
+max_log_files="5"            # Number of rotated log files to keep
+script_exit_on_error="true"  # Exit remote scripts on first error: true or false
+
+# SERVER DEFINITIONS
+# Simple format: [alias] followed by connection details
+
+[pmx,pmx-home]
+host="192.168.1.100"
+user="root"
+password="your_password_here"
+port="22"
+keyfile="ssh/pmx_key"
+
+[router,rt]
+host="192.168.1.1"
+user="admin"
+password="your_router_password"
+port="22"
+keyfile="ssh/router_key"
+
+[server1,srv1]
+host="10.0.0.10"
+user="ubuntu"
+password=""
+port="22"
+keyfile="ssh/server1_key"
+
+[server2,srv2]
+host="example.com"
+user="deploy"
+password="optional_password"
+port="2222"
+keyfile="ssh/server2_key"
+
+# End of server definitions
+
+# CONFIGURATION FORMAT REFERENCE:
+#
+# Global Configuration:
+# [global]
+# log_dir="logs"              # Log directory path
+# log_level="INFO"           # DEBUG, INFO, WARN, ERROR
+# enable_logging="true"      # true or false
+# max_log_size="10M"        # Size with K/M/G suffix
+# max_log_files="5"         # Number of log files to keep
+# script_exit_on_error="true" # Exit remote scripts on first error (true or false)
+#
+# Server Configuration:
+# [alias1,alias2,alias3]
+# host="IP_ADDRESS or HOSTNAME"
+# user="USERNAME"
+# password="PASSWORD" (optional, leave empty for key-only auth)
+# port="SSH_PORT" (optional, defaults to 22)
+# keyfile="ssh/key_name" (optional, will auto-detect ssh/<alias>_key)
+# scripts="script1.sh,script2.sh" (optional, comma-separated list)
+#
+# Authentication priority:
+# 1. SSH key (if keyfile specified or ssh/<alias>_key exists)
+# 2. Password (if specified)
+# 3. Direct SSH (relies on SSH agent or default keys)
+#
+# Security notes:
+# - SSH key authentication is recommended over passwords
+# - Store SSH keys in the ssh/ directory
+# - Keep this configuration file secure and don't commit real passwords to git
