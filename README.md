@@ -145,6 +145,11 @@ sofilab --version
 sofilab login pmx-home
 sofilab login router
 sofilab login rt
+
+# Reboot a server by alias (optional wait)
+sofilab reboot pmx           # issue reboot and exit
+sofilab reboot pmx --wait    # wait up to 180s by default
+sofilab reboot pmx --wait 300  # custom timeout seconds
 ```
 
 ## Project Structure

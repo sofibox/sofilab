@@ -380,6 +380,8 @@ Commands:
                                Run all scripts defined for host-alias in order
   run-script <host-alias> <script> [--tty|--no-tty]
                                Run a specific script on remote server
+  reboot <host-alias> [--wait [seconds]]
+                               Reboot the remote server, optionally wait for it
   list-scripts <host-alias>        List available scripts for a host-alias
   logs [type] [lines]         Show logs (type: main|error|remote, default: main, lines: default 50)
   clear-logs [type]           Clear logs (type: main|error|remote|all, default: all)
@@ -393,6 +395,7 @@ Examples:
   $SCRIPT_NAME reset-hostkey pmx    # Use after server reinstall
   $SCRIPT_NAME run-scripts pmx --no-tty
   $SCRIPT_NAME run-script pmx pmx-update-server.sh --tty
+  $SCRIPT_NAME reboot pmx --wait 180
   $SCRIPT_NAME list-scripts pmx
   $SCRIPT_NAME logs                 # Show last 50 lines of main log
   $SCRIPT_NAME logs remote 100     # Show last 100 lines of remote script log
@@ -427,6 +430,120 @@ Logging Configuration:
   - sofilab-remote.log  (remote script outputs)
 
 EOF
+}
+
+# Reboot remote server by alias, optionally wait until it's back
+reboot_server() {
+    local alias="$1"
+    shift || true
+
+    local wait_flag="false"
+    local wait_seconds=0
+
+    # Parse optional --wait [seconds]
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --wait)
+                wait_flag="true"
+                if [[ -n "${2:-}" && ! "${2:-}" =~ ^-- ]]; then
+                    wait_seconds="$2"; shift
+                else
+                    wait_seconds=180
+                fi
+                shift
+                ;;
+            *)
+                # ignore unknown flags for forward-compat
+                shift
+                ;;
+        esac
+    done
+
+    info "Loading configuration for alias: $alias"
+    get_server_config "$alias"
+    [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
+
+    # Determine working port first
+    local use_port
+    use_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST") || exit 1
+
+    # Preflight: handle host key mismatch per current port
+    ensure_hostkey_ok "$use_port"
+
+    # Resolve keyfile (silent)
+    local keyfile
+    keyfile=$(get_ssh_keyfile "$alias" "true") || true
+
+    info "Issuing reboot on $SERVER_HOST:$use_port as $SERVER_USER"
+    log_message "INFO" "Reboot requested: alias=$alias host=$SERVER_HOST port=$use_port user=$SERVER_USER wait=$wait_flag timeout=$wait_seconds"
+
+    # Build a simple, robust reboot chain without complex quoting
+    # Order: systemctl reboot -> reboot -> shutdown -r now
+    local reboot_chain_root='systemctl reboot || reboot || shutdown -r now'
+
+    # Wrap with sudo if not root; attempt passwordless first, then with password if provided
+    local remote_cmd
+    if [[ "$SERVER_USER" == "root" ]]; then
+        remote_cmd="bash -lc 'systemctl reboot || reboot || shutdown -r now'"
+    else
+        if [[ -n "$SERVER_PASSWORD" ]]; then
+            # Use a password variable inside the remote shell; try sudo -n first, then -S with the password
+            remote_cmd="bash -lc \"PW='$SERVER_PASSWORD'; sudo -n systemctl reboot || echo \\\"\\$PW\\\" | sudo -S systemctl reboot || sudo -n reboot || echo \\\"\\$PW\\\" | sudo -S reboot || sudo -n shutdown -r now || echo \\\"\\$PW\\\" | sudo -S shutdown -r now || systemctl reboot || reboot || shutdown -r now\""
+        else
+            remote_cmd="bash -lc 'sudo -n systemctl reboot || sudo -n reboot || sudo -n shutdown -r now || systemctl reboot || reboot || shutdown -r now'"
+        fi
+    fi
+
+    # Decide whether to allocate a TTY (helps with sudo that requires TTY)
+    local ssh_tty_flag=""
+    if [[ "${FORCE_TTY}" == "true" ]]; then
+        ssh_tty_flag="-tt"
+    fi
+
+    # Execute remote reboot. Connection drop is expected; treat as success.
+    local ssh_exit_code=0
+    if [[ -n "$keyfile" ]]; then
+        ssh ${ssh_tty_flag} -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$remote_cmd" || ssh_exit_code=$?
+    elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+        sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$remote_cmd" || ssh_exit_code=$?
+    else
+        ssh ${ssh_tty_flag} -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$remote_cmd" || ssh_exit_code=$?
+    fi
+
+    # SSH exit code likely non-zero due to reboot; log and proceed
+    info "Reboot command issued; SSH exit code: $ssh_exit_code (expected disconnect)"
+    log_message "INFO" "Reboot command sent; ssh_exit_code=$ssh_exit_code"
+
+    if [[ "$wait_flag" != "true" ]]; then
+        success "Reboot initiated on $SERVER_HOST"
+        return 0
+    fi
+
+    # Wait for the host to go down first (grace period), then come back up
+    local down_timeout=60
+    local waited=0
+    progress "Waiting for $SERVER_HOST to go down..."
+    while check_port_open "$SERVER_HOST" "$use_port"; do
+        sleep 2; waited=$((waited+2))
+        if [[ $waited -ge $down_timeout ]]; then
+            warn "$SERVER_HOST:$use_port still reachable after $down_timeout s; continuing"
+            break
+        fi
+    done
+
+    progress "Waiting for $SERVER_HOST to come back (up to ${wait_seconds}s)..."
+    waited=0
+    until check_port_open "$SERVER_HOST" "$use_port"; do
+        sleep 3; waited=$((waited+3))
+        if [[ $waited -ge $wait_seconds ]]; then
+            error "Timeout waiting for $SERVER_HOST:$use_port to come back"
+            log_message "ERROR" "Reboot wait timeout: host=$SERVER_HOST port=$use_port timeout=$wait_seconds"
+            return 1
+        fi
+    done
+
+    success "Server is back online: $SERVER_HOST:$use_port"
+    log_message "INFO" "Reboot completed: host back online"
 }
 
 # Load and parse server configuration for given alias
@@ -512,6 +629,19 @@ check_port_open() {
     
     # If no tools available, return success to proceed with SSH attempt
     return 0
+}
+
+# Preflight: if host key changed, remove stale known_hosts entries for the target port
+ensure_hostkey_ok() {
+    local port="$1"
+    local ssh_output
+    ssh_output=$(ssh -p "$port" -o ConnectTimeout=5 -o BatchMode=yes "$SERVER_USER@$SERVER_HOST" "echo connected" 2>&1 || true)
+    if echo "$ssh_output" | grep -q "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED\|Host key verification failed"; then
+        warn "Host key has changed for $SERVER_HOST:$port — cleaning known_hosts"
+        ssh-keygen -R "$SERVER_HOST" 2>/dev/null || true
+        ssh-keygen -R "[$SERVER_HOST]:$port" 2>/dev/null || true
+        info "Old host key removed for $SERVER_HOST:$port"
+    fi
 }
 
 # Test SSH connectivity quickly
@@ -841,6 +971,57 @@ upload_script() {
         log_message "INFO" "Script upload successful: $script_file to $alias"
         return 0
     else
+        # One-time retry: re-detect SSH port and retry upload
+        warn "Upload failed; re-checking SSH port and retrying once..."
+        local retry_port
+        retry_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
+        if [[ -n "$retry_port" ]]; then
+            if [[ "$retry_port" != "$use_port" ]]; then
+                info "Detected new SSH port $retry_port (was $use_port). Retrying upload..."
+            else
+                info "SSH port unchanged ($retry_port). Retrying upload once..."
+            fi
+            ensure_hostkey_ok "$retry_port"
+
+            # Retry mkdir
+            mkdir_success=false
+            if [[ -n "$keyfile" ]]; then
+                if ssh -i "$keyfile" -p "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$mkdir_cmd" 2>/dev/null; then
+                    mkdir_success=true
+                elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                    sleep 2
+                    progress "SSH key failed, trying password authentication..."
+                    sshpass -p "$SERVER_PASSWORD" ssh -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$mkdir_cmd" 2>/dev/null && mkdir_success=true
+                fi
+            elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                sshpass -p "$SERVER_PASSWORD" ssh -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$mkdir_cmd" 2>/dev/null && mkdir_success=true
+            else
+                ssh -p "$retry_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$mkdir_cmd" 2>/dev/null && mkdir_success=true
+            fi
+
+            # Retry upload
+            upload_success=false
+            if [[ -n "$keyfile" ]]; then
+                if scp -i "$keyfile" -P "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null; then
+                    upload_success=true
+                elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                    sleep 2
+                    progress "SSH key failed, using password authentication..."
+                    sshpass -p "$SERVER_PASSWORD" scp -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+                fi
+            elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                sshpass -p "$SERVER_PASSWORD" scp -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+            else
+                scp -P "$retry_port" -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+            fi
+
+            if [[ "$upload_success" == true ]]; then
+                success "Retry succeeded: script uploaded"
+                log_message "INFO" "Script upload successful on retry: $script_file to $alias"
+                return 0
+            fi
+        fi
+
         log_message "ERROR" "Script upload failed: $script_file to $alias"
         return 1
     fi
@@ -960,6 +1141,76 @@ execute_remote_script() {
         log_message "INFO" "Remote script execution completed successfully: $script_file on $alias"
         return 0
     else
+        # One-time retry: re-detect SSH port and retry execution
+        warn "Execution failed; re-checking SSH port and retrying once..."
+        local retry_port
+        retry_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
+        if [[ -n "$retry_port" ]]; then
+            if [[ "$retry_port" != "$use_port" ]]; then
+                info "Detected new SSH port $retry_port (was $use_port). Retrying execution..."
+            else
+                info "SSH port unchanged ($retry_port). Retrying execution once..."
+            fi
+            ensure_hostkey_ok "$retry_port"
+
+            exec_success=false
+            ssh_exit_code=0
+
+            if [[ -n "$keyfile" ]]; then
+                if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+                    ssh ${ssh_tty_flag} -i "$keyfile" -p "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+                    ssh_exit_code=${PIPESTATUS[0]}
+                else
+                    ssh ${ssh_tty_flag} -i "$keyfile" -p "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+                    ssh_exit_code=$?
+                fi
+                if [[ $ssh_exit_code -eq 0 ]]; then
+                    exec_success=true
+                elif [[ $ssh_exit_code -eq 255 ]] && [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                    sleep 2
+                    progress "SSH key failed, using password authentication..."
+                    if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+                        sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+                        ssh_exit_code=${PIPESTATUS[0]}
+                    else
+                        sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+                        ssh_exit_code=$?
+                    fi
+                    if [[ $ssh_exit_code -eq 0 ]]; then
+                        exec_success=true
+                    fi
+                fi
+            elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+                    sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+                    ssh_exit_code=${PIPESTATUS[0]}
+                else
+                    sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+                    ssh_exit_code=$?
+                fi
+                if [[ $ssh_exit_code -eq 0 ]]; then
+                    exec_success=true
+                fi
+            else
+                if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+                    ssh ${ssh_tty_flag} -p "$retry_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+                    ssh_exit_code=${PIPESTATUS[0]}
+                else
+                    ssh ${ssh_tty_flag} -p "$retry_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+                    ssh_exit_code=$?
+                fi
+                if [[ $ssh_exit_code -eq 0 ]]; then
+                    exec_success=true
+                fi
+            fi
+        fi
+
+        if [[ "$exec_success" == true ]]; then
+            success "Retry succeeded: script executed"
+            log_message "INFO" "Remote script execution successful on retry: $script_file on $alias"
+            return 0
+        fi
+
         log_message "ERROR" "Remote script execution failed: $script_file on $alias"
         return 1
     fi
@@ -1000,10 +1251,6 @@ run_scripts() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
-    # Determine working port with fallback
-    local use_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
-    [[ -z "$use_port" ]] && exit 1
-    
     # Split scripts by comma and run each
     IFS=',' read -ra script_array <<< "$SERVER_SCRIPTS"
     local total=${#script_array[@]}
@@ -1019,6 +1266,16 @@ run_scripts() {
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         
         log_message "INFO" "Processing script $count/$total: $script for $alias"
+        
+        # Re-evaluate the working SSH port before each script. Previous scripts
+        # may have changed sshd settings (e.g., port, auth), so we must detect
+        # the current open port now rather than reusing a stale value.
+        local use_port
+        use_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
+        [[ -z "$use_port" ]] && exit 1
+        
+        # Preflight: handle host key mismatch per current port
+        ensure_hostkey_ok "$use_port"
         
         # Upload script
         if upload_script "$script" "$alias" "$use_port"; then
@@ -1107,6 +1364,9 @@ run_single_script() {
     # Determine working port with fallback
     local use_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
     [[ -z "$use_port" ]] && exit 1
+    
+    # Preflight: handle host key mismatch (fresh installs)
+    ensure_hostkey_ok "$use_port"
     
     # Upload script
     if upload_script "$script_name" "$alias" "$use_port"; then
@@ -1332,6 +1592,10 @@ main() {
         login)
             [[ -z "${2:-}" ]] && { error "Host-alias required for login command"; usage; exit 1; }
             ssh_login "$2"
+            ;;
+        reboot)
+            [[ -z "${2:-}" ]] && { error "Host-alias required for reboot command"; usage; exit 1; }
+            reboot_server "$2" "${@:3}"
             ;;
         reset-hostkey)
             [[ -z "${2:-}" ]] && { error "Host-alias required for reset-hostkey command"; usage; exit 1; }
