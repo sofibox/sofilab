@@ -10,6 +10,7 @@ enable_logging="true"         # Enable/disable logging: true or false
 max_log_size="10M"           # Maximum log file size before rotation (K/M/G suffix)
 max_log_files="5"            # Number of rotated log files to keep
 script_exit_on_error="true"  # Exit remote scripts on first error: true or false
+force_tty="true"             # Allocate TTY for run-script/run-scripts: true or false
 
 # SERVER DEFINITIONS
 # Simple format: [alias] followed by connection details
@@ -54,6 +55,7 @@ keyfile="ssh/server2_key"
 # max_log_size="10M"        # Size with K/M/G suffix
 # max_log_files="5"         # Number of log files to keep
 # script_exit_on_error="true" # Exit remote scripts on first error (true or false)
+# force_tty="true"           # Force TTY allocation for remote script execution (true or false)
 #
 # Server Configuration:
 # [alias1,alias2,alias3]

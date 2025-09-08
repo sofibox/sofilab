@@ -30,6 +30,9 @@ ENABLE_LOGGING="true"
 MAX_LOG_SIZE="10M"
 MAX_LOG_FILES=5
 SCRIPT_EXIT_ON_ERROR="true"  # Default to exit remote scripts on error for safety
+# Whether to allocate a TTY for remote script execution (run-script/run-scripts)
+# Can be overridden via CLI flags --tty/--no-tty or config force_tty=true/false
+FORCE_TTY="true"
 
 # Initialize log file variables (will be set by init_logging)
 MAIN_LOG=""
@@ -124,6 +127,13 @@ load_global_config() {
                         config_errors+=("Invalid script_exit_on_error: $value (must be true or false)")
                     fi
                     ;;
+                force_tty)
+                    if [[ "$value" =~ ^(true|false)$ ]]; then
+                        FORCE_TTY="$value"
+                    else
+                        config_errors+=("Invalid force_tty: $value (must be true or false)")
+                    fi
+                    ;;
                 *)
                     # Unknown key in global section - just warn, don't fail
                     warn "Unknown global configuration key: $key"
@@ -151,7 +161,7 @@ validate_config_syntax() {
     local current_section=""
     local syntax_errors=()
     local valid_server_keys="host user password port keyfile scripts"
-    local valid_global_keys="log_dir log_level enable_logging max_log_size max_log_files script_exit_on_error"
+    local valid_global_keys="log_dir log_level enable_logging max_log_size max_log_files script_exit_on_error force_tty"
     
     while IFS= read -r line; do
         ((line_num++))
@@ -343,6 +353,21 @@ log_remote_output() {
     fi
 }
 
+# Stream logger for remote output (used with interactive sessions)
+# Reads from stdin and appends each line to the remote log with metadata
+log_remote_output_stream() {
+    local alias="$1"
+    local script_name="$2"
+    # If logging disabled or REMOTE_LOG unset, just consume input without logging
+    if [[ "$ENABLE_LOGGING" != "true" ]] || [[ -z "$REMOTE_LOG" ]]; then
+        cat >/dev/null
+        return 0
+    fi
+    while IFS= read -r line; do
+        log_remote_output "$alias" "$script_name" "$line"
+    done
+}
+
 # Show usage
 usage() {
     cat << EOF
@@ -351,8 +376,10 @@ Usage: $SCRIPT_NAME <command> [host-alias] [options]
 Commands:
   login <host-alias>               Connect to configured host using SSH alias
   reset-hostkey <host-alias>       Remove stored SSH host key (for reinstalled servers)
-  run-scripts <host-alias>         Run all scripts defined for host-alias in order
-  run-script <host-alias> <script> Run a specific script on remote server
+  run-scripts <host-alias> [--tty|--no-tty]
+                               Run all scripts defined for host-alias in order
+  run-script <host-alias> <script> [--tty|--no-tty]
+                               Run a specific script on remote server
   list-scripts <host-alias>        List available scripts for a host-alias
   logs [type] [lines]         Show logs (type: main|error|remote, default: main, lines: default 50)
   clear-logs [type]           Clear logs (type: main|error|remote|all, default: all)
@@ -364,8 +391,8 @@ Commands:
 Examples:
   $SCRIPT_NAME login pmx
   $SCRIPT_NAME reset-hostkey pmx    # Use after server reinstall
-  $SCRIPT_NAME run-scripts pmx
-  $SCRIPT_NAME run-script pmx pmx-update-server.sh
+  $SCRIPT_NAME run-scripts pmx --no-tty
+  $SCRIPT_NAME run-script pmx pmx-update-server.sh --tty
   $SCRIPT_NAME list-scripts pmx
   $SCRIPT_NAME logs                 # Show last 50 lines of main log
   $SCRIPT_NAME logs remote 100     # Show last 100 lines of remote script log
@@ -856,14 +883,6 @@ execute_remote_script() {
     
     local exec_success=false
     
-    # Function to prefix remote output and log it
-    prefix_and_log_remote_output() {
-        while IFS= read -r line; do
-            echo "[REMOTE] $line"
-            log_remote_output "$alias" "$script_file" "$line"
-        done
-    }
-    
     debug "Executing remote script: $script_file on $alias ($SERVER_HOST:$use_port)"
     log_message "INFO" "Starting remote script execution: $script_file on $alias ($SERVER_HOST:$use_port)"
     
@@ -872,10 +891,21 @@ execute_remote_script() {
     local ssh_exit_code=0
     local auth_attempted=false
     
+    # Decide whether to allocate a TTY for SSH session
+    local ssh_tty_flag=""
+    if [[ "${FORCE_TTY}" == "true" ]]; then
+        ssh_tty_flag="-tt"
+    fi
+
     if [[ -n "$keyfile" ]]; then
         # Try SSH key first
-        ssh -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
-        ssh_exit_code=${PIPESTATUS[0]}
+        if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+            ssh ${ssh_tty_flag} -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+            ssh_exit_code=${PIPESTATUS[0]}
+        else
+            ssh ${ssh_tty_flag} -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+            ssh_exit_code=$?
+        fi
         auth_attempted=true
         
         if [[ $ssh_exit_code -eq 0 ]]; then
@@ -884,8 +914,13 @@ execute_remote_script() {
             # SSH authentication failed (exit code 255), try password
             sleep 2
             progress "SSH key failed, using password authentication..."
-            sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
-            ssh_exit_code=${PIPESTATUS[0]}
+            if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+                sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+                ssh_exit_code=${PIPESTATUS[0]}
+            else
+                sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+                ssh_exit_code=$?
+            fi
             if [[ $ssh_exit_code -eq 0 ]]; then
                 exec_success=true
             fi
@@ -895,16 +930,26 @@ execute_remote_script() {
         fi
     elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
         # No SSH key, use password directly
-        sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
-        ssh_exit_code=${PIPESTATUS[0]}
+        if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+            sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+            ssh_exit_code=${PIPESTATUS[0]}
+        else
+            sshpass -p "$SERVER_PASSWORD" ssh ${ssh_tty_flag} -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+            ssh_exit_code=$?
+        fi
         auth_attempted=true
         if [[ $ssh_exit_code -eq 0 ]]; then
             exec_success=true
         fi
     else
         # Try without any authentication method (will prompt for password)
-        ssh -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
-        ssh_exit_code=${PIPESTATUS[0]}
+        if [[ "$ENABLE_LOGGING" == "true" ]] && [[ -n "$REMOTE_LOG" ]]; then
+            ssh ${ssh_tty_flag} -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | tee >(log_remote_output_stream "$alias" "$script_file")
+            ssh_exit_code=${PIPESTATUS[0]}
+        else
+            ssh ${ssh_tty_flag} -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1
+            ssh_exit_code=$?
+        fi
         auth_attempted=true
         if [[ $ssh_exit_code -eq 0 ]]; then
             exec_success=true
@@ -923,9 +968,23 @@ execute_remote_script() {
 # Run all scripts defined for a host-alias in order
 run_scripts() {
     local alias="$1"
-    
+    shift || true
+
     info "Loading configuration for alias: $alias"
     get_server_config "$alias"
+
+    # Optional flags for TTY control (CLI overrides config)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tty)
+                FORCE_TTY="true"; shift ;;
+            --no-tty)
+                FORCE_TTY="false"; shift ;;
+            *)
+                # Ignore unknown options
+                shift ;;
+        esac
+    done
     
     [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
     [[ -z "$SERVER_SCRIPTS" ]] && { warn "No scripts defined for host-alias: $alias"; exit 0; }
@@ -1008,9 +1067,23 @@ run_scripts() {
 run_single_script() {
     local alias="$1"
     local script_name="$2"
+    shift 2 || true
     
     info "Loading configuration for alias: $alias"
     get_server_config "$alias"
+
+    # Optional flags for TTY control (CLI overrides config)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tty)
+                FORCE_TTY="true"; shift ;;
+            --no-tty)
+                FORCE_TTY="false"; shift ;;
+            *)
+                # Ignore unknown options
+                shift ;;
+        esac
+    done
     
     [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
     
@@ -1266,12 +1339,12 @@ main() {
             ;;
         run-scripts)
             [[ -z "${2:-}" ]] && { error "Host-alias required for run-scripts command"; usage; exit 1; }
-            run_scripts "$2"
+            run_scripts "$2" "${@:3}"
             ;;
         run-script)
             [[ -z "${2:-}" ]] && { error "Host-alias required for run-script command"; usage; exit 1; }
             [[ -z "${3:-}" ]] && { error "Script name required for run-script command"; usage; exit 1; }
-            run_single_script "$2" "$3"
+            run_single_script "$2" "$3" "${@:4}"
             ;;
         list-scripts)
             [[ -z "${2:-}" ]] && { error "Host-alias required for list-scripts command"; usage; exit 1; }
