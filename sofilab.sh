@@ -12,6 +12,7 @@ set -Eeuo pipefail
 # Version information
 VERSION="1.0.0"
 BUILD_DATE="2025-09-05"
+AUTHOR="Arafat Ali <arafat@sofibox.com>"
 
 # Global variables
 # Resolve symlink to get the real script directory
@@ -386,6 +387,36 @@ except Exception:\
     fi
 
     [[ -n "$ip" ]] && echo "$ip" || return 1
+}
+
+# Render a compact, readable header for interactive commands (plain text)
+script_header() {
+    local context_title="$1"      # e.g., "Login" (optional)
+    local alias="$2"              # e.g., host alias (optional)
+    local host="$3"               # e.g., hostname (optional)
+    local ip="$4"                 # e.g., resolved IP (optional)
+    local port="$5"               # e.g., port (optional)
+
+    local border
+    border=$(printf '%*s' 70 '' | tr ' ' '=')
+
+    echo "$border"
+    echo "SofiLab • Server Management Tool by $AUTHOR"
+    echo "Script: $SCRIPT_NAME  Version: $VERSION (Build $BUILD_DATE)"
+    [[ -n "$context_title" ]] && echo "Action: $context_title"
+    if [[ -n "$alias" || -n "$host" ]]; then
+        local target_line=""
+        target_line="${alias:+$alias -> }${host}"
+        if [[ -n "$ip" && "$ip" != "$host" ]]; then
+            target_line+=" ($ip)"
+        fi
+        if [[ -n "$port" ]]; then
+            target_line+=" :$port"
+        fi
+        echo "Target: $target_line"
+    fi
+    echo "Hostname: $(hostname)  When: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "$border"
 }
 
 # Log remote script output
@@ -844,12 +875,9 @@ ssh_login() {
     [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
     
     info "Connecting to $SERVER_HOST as $SERVER_USER"
-    # Show resolved IP if available
+    # Resolve host IP (if possible) for display
     local resolved_ip=""
     resolved_ip=$(resolve_host_ip "$SERVER_HOST" 2>/dev/null || true)
-    if [[ -n "$resolved_ip" && "$resolved_ip" != "$SERVER_HOST" ]]; then
-        info "Resolved IP: $resolved_ip"
-    fi
     log_message "INFO" "SSH login attempt - alias: $alias, host: $SERVER_HOST, user: $SERVER_USER"
     
     # Determine SSH key
@@ -869,6 +897,9 @@ ssh_login() {
     local use_port=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST")
     [[ -z "$use_port" ]] && exit 1
     
+    # Show a compact header for interactive context
+    script_header "Login" "$alias" "$SERVER_HOST" "${resolved_ip:-}" "$use_port"
+
     # Now attempt SSH connection on the verified open port
     info "Attempting SSH connection on port $use_port..."
     if test_ssh_connection "$use_port" "$keyfile"; then
