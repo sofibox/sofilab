@@ -341,6 +341,53 @@ debug() {
     }
 }
 
+# Resolve a hostname to an IP address (IPv4 preferred), with fallbacks
+resolve_host_ip() {
+    local host="$1"
+    # If already an IPv4 or IPv6 address, return as-is
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || [[ "$host" == *:* ]]; then
+        echo "$host"
+        return 0
+    fi
+
+    local ip=""
+
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short A "$host" 2>/dev/null | awk 'NF{print; exit}') || true
+        if [[ -z "$ip" ]]; then
+            ip=$(dig +short AAAA "$host" 2>/dev/null | awk 'NF{print; exit}') || true
+        fi
+    fi
+
+    if [[ -z "$ip" ]] && command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}') || true
+        if [[ -z "$ip" ]]; then
+            ip=$(getent ahosts "$host" 2>/dev/null | awk 'NF{print $1; exit}') || true
+        fi
+    fi
+
+    if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+        ip=$(host -t A "$host" 2>/dev/null | awk '/ has address /{print $4; exit}') || true
+        if [[ -z "$ip" ]]; then
+            ip=$(host -t AAAA "$host" 2>/dev/null | awk '/ has IPv6 address /{print $5; exit}') || true
+        fi
+    fi
+
+    if [[ -z "$ip" ]] && command -v nslookup >/dev/null 2>&1; then
+        ip=$(nslookup "$host" 2>/dev/null | awk '/^Address: /{print $2; exit}') || true
+    fi
+
+    if [[ -z "$ip" ]] && command -v python3 >/dev/null 2>&1; then
+        ip=$(python3 -c 'import socket,sys;\
+try:\
+ print(socket.gethostbyname(sys.argv[1]))\
+except Exception:\
+ pass' "$host" 2>/dev/null) || true
+    fi
+
+    [[ -n "$ip" ]] && echo "$ip" || return 1
+}
+
 # Log remote script output
 log_remote_output() {
     local alias="$1"
@@ -374,63 +421,59 @@ usage() {
 Usage: $SCRIPT_NAME <command> [host-alias] [options]
 
 Commands:
-  login <host-alias>               Connect to configured host using SSH alias
-  reset-hostkey <host-alias>       Remove stored SSH host key (for reinstalled servers)
-  status <host-alias> [--port PORT]
-                               Check SSH reachability and auth methods
-  run-scripts <host-alias> [--tty|--no-tty]
-                               Run all scripts defined for host-alias in order
-  run-script <host-alias> <script> [--tty|--no-tty]
-                               Run a specific script on remote server
-  reboot <host-alias> [--wait [seconds]]
-                               Reboot the remote server, optionally wait for it
-  list-scripts <host-alias>        List available scripts for a host-alias
-  logs [type] [lines]         Show logs (type: main|error|remote, default: main, lines: default 50)
-  clear-logs [type]           Clear logs (type: main|error|remote|all, default: all)
-  install                     Install sofilab command globally (requires sudo)
-  uninstall                   Uninstall sofilab command (requires sudo)
-  --version, -V               Show version information
-  --help, -h                  Show this help message
+  login <host-alias>                                 Connect to configured host using SSH alias
+  reset-hostkey <host-alias>                         Remove stored SSH host key (for reinstalled servers)
+  status <host-alias> [--port PORT]                  Check SSH reachability and auth methods
+  run-scripts <host-alias> [--tty|--no-tty]          Run all scripts defined for host-alias in order
+  run-script <host-alias> <script> [--tty|--no-tty]  Run a specific script on remote server
+  reboot <host-alias> [--wait [seconds]]             Reboot the remote server, optionally wait for it
+  list-scripts <host-alias>                          List available scripts for a host-alias
+  logs [type] [lines]                                Show logs (type: main|error|remote; default type: main; default lines: 50)
+  clear-logs [type]                                  Clear logs (type: main|error|remote|all; default: all)
+  install                                            Install sofilab command globally (requires sudo)
+  uninstall                                          Uninstall sofilab command (requires sudo)
+  --version, -V                                      Show version information
+  --help, -h                                         Show this help message
 
 Examples:
-  $SCRIPT_NAME login pmx
-  $SCRIPT_NAME reset-hostkey pmx    # Use after server reinstall
-  $SCRIPT_NAME run-scripts pmx --no-tty
-  $SCRIPT_NAME run-script pmx pmx-update-server.sh --tty
-  $SCRIPT_NAME status pmx
-  $SCRIPT_NAME reboot pmx --wait 180
-  $SCRIPT_NAME list-scripts pmx
-  $SCRIPT_NAME logs                 # Show last 50 lines of main log
-  $SCRIPT_NAME logs remote 100     # Show last 100 lines of remote script log
-  $SCRIPT_NAME logs error          # Show error log
-  $SCRIPT_NAME clear-logs           # Clear all logs
-  $SCRIPT_NAME clear-logs remote    # Clear only remote script log
+  $SCRIPT_NAME login pmx               # Connect to server with alias 'pmx'
+  $SCRIPT_NAME reset-hostkey pmx       # Use after server reinstall
+  $SCRIPT_NAME run-scripts pmx --no-tty 
+                                       # Disable TTY allocation
+  $SCRIPT_NAME run-script pmx pmx-update-server.sh --tty 
+                                       # Force TTY allocation
+  $SCRIPT_NAME status pmx              # Check if server is reachable
+  $SCRIPT_NAME reboot pmx --wait 180   # Wait up to 180 seconds for reboot
+  $SCRIPT_NAME list-scripts pmx        # List scripts for alias 'pmx'
+  $SCRIPT_NAME logs                    # Show last 50 lines of main log
+  $SCRIPT_NAME logs remote 100         # Show last 100 lines of remote script log
+  $SCRIPT_NAME logs error              # Show error log
+  $SCRIPT_NAME clear-logs              # Clear all logs
+  $SCRIPT_NAME clear-logs remote       # Clear only remote script log
   $SCRIPT_NAME install
 
-Configuration format in sofilab.conf:
-  Global Configuration:
-  [global]
-  log_dir="logs"                    # Directory for log files
-  log_level="INFO"                  # Logging level: DEBUG, INFO, WARN, ERROR
-  enable_logging="true"             # Enable/disable logging: true or false
-  max_log_size="10M"               # Maximum log file size before rotation
-  max_log_files="5"                # Number of rotated log files to keep
-  script_exit_on_error="true"      # Exit remote scripts on first error: true or false
+Configuration (sofilab.conf):
+  [global]                           # Global settings
+  log_dir="logs"                     # Directory for log files
+  log_level="INFO"                   # Logging level: DEBUG, INFO, WARN, ERROR
+  enable_logging="true"              # Enable or disable logging
+  max_log_size="10M"                 # Max log file size before rotation
+  max_log_files="5"                  # Number of rotated log files to keep
+  script_exit_on_error="true"        # Exit remote scripts on first error
 
-  Server Configuration:
-  [host-alias1,host-alias2]
-  host="IP_ADDRESS"
-  user="USERNAME"
-  password="PASSWORD"
-  port="SSH_PORT" (optional, default 22)
-  keyfile="ssh/host-alias_key" (optional)
-  scripts="script1.sh,script2.sh" (optional, comma-separated)
+  [host-alias1,host-alias2]          # Server definitions (multiple aliases per section allowed) 
+  host="IP_ADDRESS"                  # Required   
+  user="USERNAME"                    # Required  
+  password="PASSWORD"                # Optional (if using password auth)
+  port="SSH_PORT"                    # Optional (default: 22)
+  keyfile="ssh/host-alias_key"       # Optional
+  scripts="script1.sh,script2.sh"    # Optional, comma-separated
 
-Logging Configuration:
+Logging:
   Logs are stored in: $SCRIPT_DIR/logs/
-  - sofilab.log         (main log with all operations)
-  - sofilab-error.log   (errors only)
-  - sofilab-remote.log  (remote script outputs)
+  - sofilab.log          Main log with all operations
+  - sofilab-error.log    Errors only
+  - sofilab-remote.log   Remote script outputs
 
 EOF
 }
@@ -801,6 +844,12 @@ ssh_login() {
     [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
     
     info "Connecting to $SERVER_HOST as $SERVER_USER"
+    # Show resolved IP if available
+    local resolved_ip=""
+    resolved_ip=$(resolve_host_ip "$SERVER_HOST" 2>/dev/null || true)
+    if [[ -n "$resolved_ip" && "$resolved_ip" != "$SERVER_HOST" ]]; then
+        info "Resolved IP: $resolved_ip"
+    fi
     log_message "INFO" "SSH login attempt - alias: $alias, host: $SERVER_HOST, user: $SERVER_USER"
     
     # Determine SSH key
@@ -931,7 +980,13 @@ determine_ssh_port() {
     local host="$2"
     
     # Check configured port first
-    progress "Checking connection to $host:$configured_port..."
+    local display_host="$host"
+    local _rip=""
+    _rip=$(resolve_host_ip "$host" 2>/dev/null || true)
+    if [[ -n "$_rip" && "$_rip" != "$host" ]]; then
+        display_host="$host ($_rip)"
+    fi
+    progress "Checking connection to $display_host:$configured_port..."
     if check_port_open "$host" "$configured_port"; then
         info "Port $configured_port is open $([ "$configured_port" == "22" ] && echo "(default SSH port)" || echo "(custom SSH port)")"
         echo "$configured_port"
