@@ -376,6 +376,8 @@ Usage: $SCRIPT_NAME <command> [host-alias] [options]
 Commands:
   login <host-alias>               Connect to configured host using SSH alias
   reset-hostkey <host-alias>       Remove stored SSH host key (for reinstalled servers)
+  status <host-alias> [--port PORT]
+                               Check SSH reachability and auth methods
   run-scripts <host-alias> [--tty|--no-tty]
                                Run all scripts defined for host-alias in order
   run-script <host-alias> <script> [--tty|--no-tty]
@@ -395,6 +397,7 @@ Examples:
   $SCRIPT_NAME reset-hostkey pmx    # Use after server reinstall
   $SCRIPT_NAME run-scripts pmx --no-tty
   $SCRIPT_NAME run-script pmx pmx-update-server.sh --tty
+  $SCRIPT_NAME status pmx
   $SCRIPT_NAME reboot pmx --wait 180
   $SCRIPT_NAME list-scripts pmx
   $SCRIPT_NAME logs                 # Show last 50 lines of main log
@@ -430,6 +433,88 @@ Logging Configuration:
   - sofilab-remote.log  (remote script outputs)
 
 EOF
+}
+
+# Check server status (port reachability and basic auth capability)
+server_status() {
+    local alias="$1"
+    shift || true
+
+    local override_port=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)
+                override_port="${2:-}"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    info "Loading configuration for alias: $alias"
+    get_server_config "$alias"
+    [[ -z "$SERVER_HOST" ]] && { error "Unknown host-alias: $alias"; exit 1; }
+
+    local port_to_check
+    if [[ -n "$override_port" ]]; then
+        port_to_check="$override_port"
+    else
+        port_to_check=$(determine_ssh_port "$SERVER_PORT" "$SERVER_HOST") || {
+            error "Server not reachable on configured port(s)"; return 1;
+        }
+    fi
+
+    echo ""
+    echo "🩺 Server Status"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📍 Host: $SERVER_HOST"
+    echo "🔌 SSH Port: $port_to_check"
+
+    if check_port_open "$SERVER_HOST" "$port_to_check"; then
+        success "Port reachable"
+    else
+        error "Port not reachable"; return 1
+    fi
+
+    # Try keyfile detection
+    local keyfile=""
+    keyfile=$(get_ssh_keyfile "$alias" "true") || true
+
+    # Probe SSH auth non-interactively
+    local auth_ok="false"
+    if [[ -n "$keyfile" && -f "$keyfile" ]]; then
+        if ssh -i "$keyfile" -p "$port_to_check" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "echo ok" >/dev/null 2>&1; then
+            echo "🔐 Auth: SSH key works"
+            auth_ok="true"
+        fi
+    fi
+
+    if [[ "$auth_ok" != "true" && -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+        if sshpass -p "$SERVER_PASSWORD" ssh -p "$port_to_check" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "echo ok" >/dev/null 2>&1; then
+            echo "🔐 Auth: Password works"
+            auth_ok="true"
+        fi
+    fi
+
+    if [[ "$auth_ok" != "true" ]]; then
+        echo "🔐 Auth: Unknown (may require interactive password or key not found)"
+    fi
+
+    # Basic uptime ping (reuse the same auth method that worked)
+    local ssh_cmd
+    if [[ -n "$keyfile" && -f "$keyfile" ]]; then
+        ssh_cmd=(ssh -i "$keyfile" -p "$port_to_check" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5)
+    elif [[ -n "${SERVER_PASSWORD:-}" ]] && command -v sshpass >/dev/null 2>&1; then
+        ssh_cmd=(sshpass -p "$SERVER_PASSWORD" ssh -p "$port_to_check" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5)
+    else
+        ssh_cmd=(ssh -p "$port_to_check" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5)
+    fi
+
+    if "${ssh_cmd[@]}" "$SERVER_USER@$SERVER_HOST" "uname -a && uptime" 2>/dev/null | sed -e 's/^/   /'; then
+        success "Retrieved basic system info"
+    else
+        warn "Could not retrieve system info non-interactively"
+    fi
+
+    return 0
 }
 
 # Reboot remote server by alias, optionally wait until it's back
@@ -1600,6 +1685,10 @@ main() {
         reset-hostkey)
             [[ -z "${2:-}" ]] && { error "Host-alias required for reset-hostkey command"; usage; exit 1; }
             reset_hostkey "$2"
+            ;;
+        status)
+            [[ -z "${2:-}" ]] && { error "Host-alias required for status command"; usage; exit 1; }
+            server_status "$2" "${@:3}"
             ;;
         run-scripts)
             [[ -z "${2:-}" ]] && { error "Host-alias required for run-scripts command"; usage; exit 1; }
