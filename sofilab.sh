@@ -1122,22 +1122,43 @@ upload_script() {
     
     if [[ -n "$keyfile" ]]; then
         # Try SSH key first
-        if scp -i "$keyfile" -P "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null; then
+        if scp -O -i "$keyfile" -P "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null; then
             upload_success=true
         elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
             # SSH key failed, add small delay to avoid triggering fail2ban
             sleep 2
             progress "SSH key failed, using password authentication..."
-            sshpass -p "$SERVER_PASSWORD" scp -P "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+            sshpass -p "$SERVER_PASSWORD" scp -O -P "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
         fi
     elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
         # No SSH key, use password directly
-        sshpass -p "$SERVER_PASSWORD" scp -P "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+        sshpass -p "$SERVER_PASSWORD" scp -O -P "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
     else
         # Try without any authentication method (will prompt for password)
-        scp -P "$use_port" -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+        scp -O -P "$use_port" -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
     fi
     
+    # If SCP failed, try SSH+cat fallback (works where SFTP/SCP server is unavailable)
+    if [[ "$upload_success" != true ]]; then
+        debug "SCP failed; attempting SSH+cat fallback upload"
+        if [[ -n "$keyfile" ]]; then
+            if ssh -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 \
+                "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null; then
+                upload_success=true
+            elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                sleep 2
+                progress "SSH key failed, using password authentication..."
+                sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                    "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+            fi
+        elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+            sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+        else
+            ssh -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+        fi
+    fi
+
     if [[ "$upload_success" == true ]]; then
         log_message "INFO" "Script upload successful: $script_file to $alias"
         return 0
@@ -1173,17 +1194,38 @@ upload_script() {
             # Retry upload
             upload_success=false
             if [[ -n "$keyfile" ]]; then
-                if scp -i "$keyfile" -P "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null; then
+                if scp -O -i "$keyfile" -P "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null; then
                     upload_success=true
                 elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
                     sleep 2
                     progress "SSH key failed, using password authentication..."
-                    sshpass -p "$SERVER_PASSWORD" scp -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+                    sshpass -p "$SERVER_PASSWORD" scp -O -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
                 fi
             elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
-                sshpass -p "$SERVER_PASSWORD" scp -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+                sshpass -p "$SERVER_PASSWORD" scp -O -P "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
             else
-                scp -P "$retry_port" -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+                scp -O -P "$retry_port" -o ConnectTimeout=5 "$SCRIPT_DIR/scripts/$script_file" "$SERVER_USER@$SERVER_HOST:$remote_path" 2>/dev/null && upload_success=true
+            fi
+
+            # Retry fallback via SSH+cat if SCP still failed
+            if [[ "$upload_success" != true ]]; then
+                debug "Retrying SSH+cat fallback upload"
+                if [[ -n "$keyfile" ]]; then
+                    if ssh -i "$keyfile" -p "$retry_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 \
+                        "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null; then
+                        upload_success=true
+                    elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                        sleep 2
+                        progress "SSH key failed, using password authentication..."
+                        sshpass -p "$SERVER_PASSWORD" ssh -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                            "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+                    fi
+                elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+                    sshpass -p "$SERVER_PASSWORD" ssh -p "$retry_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                        "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+                else
+                    ssh -p "$retry_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "cat > '$remote_path'" < "$SCRIPT_DIR/scripts/$script_file" 2>/dev/null && upload_success=true
+                fi
             fi
 
             if [[ "$upload_success" == true ]]; then
@@ -1225,13 +1267,26 @@ execute_remote_script() {
     fi
     local env_vars="SSH_PORT='$SERVER_PORT' ACTUAL_PORT='$use_port' ADMIN_USER='$SERVER_USER' SSH_KEY_PATH='$ssh_key_path' SSH_PUBLIC_KEY='$ssh_public_key'"
     
+    # Choose remote shell (prefer bash; fallback to sh)
+    local remote_shell="bash"
+    local probe_output=""
+    if [[ -n "$keyfile" ]]; then
+        probe_output=$(ssh -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "command -v bash >/dev/null 2>&1 && echo bash || echo sh" 2>/dev/null || true)
+    fi
+    if [[ -z "$probe_output" ]] && [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+        probe_output=$(sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "command -v bash >/dev/null 2>&1 && echo bash || echo sh" 2>/dev/null || true)
+    fi
+    if [[ "$probe_output" == "sh" ]]; then
+        remote_shell="sh"
+    fi
+
     # Execute script remotely (using full path from home directory)
     # Apply script_exit_on_error setting if enabled, store the exit code and clean up regardless of success/failure
-    local bash_opts=""
+    local shell_opts=""
     if [[ "$SCRIPT_EXIT_ON_ERROR" == "true" ]]; then
-        bash_opts="-e"  # Exit script on first error
+        shell_opts="-e"  # Exit script on first error (supported by bash/sh)
     fi
-    local ssh_cmd="cd ~ && chmod +x $remote_path && $env_vars bash $bash_opts $remote_path; script_exit_code=\$?; rm -f $remote_path; exit \$script_exit_code"
+    local ssh_cmd="cd ~ && chmod +x $remote_path && $env_vars $remote_shell $shell_opts $remote_path; script_exit_code=\$?; rm -f $remote_path; exit \$script_exit_code"
     
     local exec_success=false
     
