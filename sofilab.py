@@ -130,14 +130,14 @@ def init_logging(cfg: GlobalConfig) -> None:
     fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
 
     if MAIN_LOG:
-        h_main = RotatingFileHandler(MAIN_LOG, maxBytes=cfg.max_bytes(), backupCount=cfg.max_log_files)
+        h_main = RotatingFileHandler(MAIN_LOG, maxBytes=cfg.max_bytes(), backupCount=cfg.max_log_files, encoding="utf-8")
         h_main.setFormatter(fmt)
         h_main.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
         root.addHandler(h_main)
 
     # Separate error file
     if ERROR_LOG:
-        h_err = RotatingFileHandler(ERROR_LOG, maxBytes=cfg.max_bytes(), backupCount=cfg.max_log_files)
+        h_err = RotatingFileHandler(ERROR_LOG, maxBytes=cfg.max_bytes(), backupCount=cfg.max_log_files, encoding="utf-8")
         h_err.setFormatter(fmt)
         h_err.setLevel(logging.ERROR)
         root.addHandler(h_err)
