@@ -1195,11 +1195,61 @@ def reset_hostkey(sc: ServerConfig) -> int:
 def install_cli() -> int:
     # Always install the Python CLI as the main command
     if os.name == "nt":
-        print("Windows install:")
-        print("- Option 1: Add this repo to PATH and run `sofilab.py`.")
-        print("- Option 2: Create a sofilab.cmd wrapper pointing to python sofilab.py.")
-        print("Example wrapper content: \n  @echo off\n  python \"%~dp0sofilab.py\" %*\nPlace it in a directory on your PATH.")
-        return 0
+        # Windows: create a per-user bin directory, write a wrapper, and add it to PATH
+        try:
+            local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            install_dir = Path(local_app) / "SofiLab" / "bin"
+            install_dir.mkdir(parents=True, exist_ok=True)
+
+            wrapper = install_dir / "sofilab.cmd"
+            # Use the current Python executable to avoid relying on PATH
+            py = sys.executable
+            script = str(SCRIPT_PATH)
+            wrapper.write_text(
+                "@echo off\r\n"
+                f"\"{py}\" \"{script}\" %*\r\n",
+                encoding="utf-8"
+            )
+
+            # Add install_dir to the user's PATH in HKCU\Environment
+            try:
+                import winreg  # type: ignore
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
+                    try:
+                        current_path, reg_type = winreg.QueryValueEx(k, "Path")
+                    except FileNotFoundError:
+                        current_path, reg_type = "", winreg.REG_EXPAND_SZ
+                # Normalize and check membership
+                parts = [p.strip() for p in current_path.split(";") if p.strip()]
+                norm_parts = {p.lower().rstrip("\\/") for p in parts}
+                norm_target = str(install_dir).lower().rstrip("\\/")
+                if norm_target not in norm_parts:
+                    new_path = (";".join(parts + [str(install_dir)])).strip(";")
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
+                        # Preserve value type if possible
+                        reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
+                        winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
+                    # Broadcast environment change so new consoles pick it up
+                    try:
+                        import ctypes
+                        HWND_BROADCAST = 0xFFFF
+                        WM_SETTINGCHANGE = 0x001A
+                        SMTO_ABORTIFHUNG = 0x0002
+                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                                                                 "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                    except Exception:
+                        pass
+            except Exception:
+                # Non-fatal if PATH update fails; wrapper still created
+                pass
+
+            info("✓ Installation successful! Open a new terminal to use 'sofilab'.")
+            print(f"Installed wrapper: {wrapper}")
+            print(f"Added to PATH (if needed): {install_dir}")
+            return 0
+        except Exception as e:
+            error(f"Windows installation failed: {e}")
+            return 1
     # POSIX
     install_dir = Path("/usr/local/bin")
     dest = install_dir / "sofilab"
@@ -1220,8 +1270,19 @@ def install_cli() -> int:
 
 def uninstall_cli() -> int:
     if os.name == "nt":
-        print("Windows uninstall: remove any custom sofilab.cmd wrapper you created.")
-        return 0
+        try:
+            local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            install_dir = Path(local_app) / "SofiLab" / "bin"
+            wrapper = install_dir / "sofilab.cmd"
+            if wrapper.exists():
+                wrapper.unlink()
+                info("Removed Windows wrapper sofilab.cmd")
+            else:
+                warn("No Windows wrapper found to remove")
+            return 0
+        except Exception as e:
+            error(f"Windows uninstallation failed: {e}")
+            return 1
     dest = Path("/usr/local/bin/sofilab")
     if dest.exists() or dest.is_symlink():
         try:
