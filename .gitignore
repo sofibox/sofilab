@@ -9,6 +9,7 @@ ssh/
 *.pfx
 
 # Backup files
+backup/
 *.bak
 *.bak.*
 *.backup

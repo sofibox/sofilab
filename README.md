@@ -34,35 +34,62 @@ A comprehensive server management tool for SSH connections, server monitoring, i
 
 ## Installation
 
+### Python CLI (Cross‑Platform)
+
+- Install dependencies:
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+- Copy config and edit:
+
+  ```bash
+  cp sofilab.conf.sample sofilab.conf
+  ```
+
+- Run commands (works on macOS, Linux, Windows):
+
+  ```bash
+  python sofilab.py --help
+  python sofilab.py status pmx
+  python sofilab.py login pmx
+  python sofilab.py run-scripts pmx
+  ```
+
+- Optional install shortcut:
+  - macOS/Linux: `python sofilab.py install` creates `/usr/local/bin/sofilab` symlink.
+  - Windows: create a `sofilab.cmd` wrapper that runs `python sofilab.py` and place it on your PATH.
+
 ### Quick Setup (Recommended)
 
-1. **Clone the repository:**
+1. Clone the repository:
 
    ```bash
    git clone https://github.com/arafatx/sofilab.git
    cd sofilab
    ```
 
-2. **Create your configuration:**
+2. Install Python dependencies (auto-installs on first run too):
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. Create your configuration:
 
    ```bash
    cp sofilab.conf.sample sofilab.conf
    nano sofilab.conf  # Edit with your server details
    ```
 
-3. **Install globally:**
+4. Install the CLI globally (macOS/Linux):
 
    ```bash
-   ./setup.sh install
+   python sofilab.py install
    ```
 
-4. **Restart your terminal or reload your shell:**
-
-   ```bash
-   source ~/.zshrc  # or restart your terminal
-   ```
-
-5. **Verify installation:**
+5. Verify installation:
 
    ```bash
    sofilab --version
@@ -70,12 +97,12 @@ A comprehensive server management tool for SSH connections, server monitoring, i
 
 Now you can use `sofilab` from anywhere!
 
-### Manual Usage (Without Installation)
+### Manual Usage (without installing)
 
-If you prefer not to install globally, you can use the script directly:
+If you prefer not to install globally, you can run directly with Python:
 
 ```bash
-./sofilab.sh login pmx
+python sofilab.py login pmx
 ```
 
 ## Quick Start
@@ -157,9 +184,8 @@ sofilab reboot pmx --wait 300  # custom timeout seconds
 ```text
 sofilab/
 ├── README.md             # This documentation
-├── sofilab.sh            # Main server management script
+├── sofilab.py            # Main server management script (Python)
 ├── sofilab.conf.sample   # Sample configuration file
-├── setup.sh              # Installation script
 ├── TODO.md               # Development notes
 ├── .gitignore            # Git ignore rules
 └── ssh/                  # SSH key storage (excluded from git)
@@ -172,17 +198,14 @@ sofilab/
 
 ## Setup Commands
 
-The `setup.sh` script provides simple installation management:
+Use the Python CLI:
 
 ```bash
-# Install sofilab globally
-./setup.sh install
+# Install sofilab globally (macOS/Linux)
+python sofilab.py install
 
-# Check installation status
-./setup.sh status
-
-# Remove sofilab
-./setup.sh remove
+# Uninstall
+python sofilab.py uninstall
 ```
 
 ## Security Notes
