@@ -3,6 +3,7 @@ sofilab.conf
 
 # Ignore SSH keys and sensitive data
 ssh/
+wireguard/
 *.key
 *.pem
 *.p12

@@ -177,6 +177,16 @@ sofilab login rt
 sofilab reboot pmx           # issue reboot and exit
 sofilab reboot pmx --wait    # wait up to 180s by default
 sofilab reboot pmx --wait 300  # custom timeout seconds
+
+# Copy files (scp-like; preferred)
+# Remote paths use alias:/path
+sofilab cp pmx:/var/log/syslog ./logs
+sofilab cp -r pmx:/etc/nginx ./backups
+sofilab cp ./notes.txt pmx:~/uploads
+sofilab cp -r ./mydir pmx:~/projects
+
+# List files on remote host (SFTP)
+sofilab ls-remote pmx ~
 ```
 
 ## Project Structure

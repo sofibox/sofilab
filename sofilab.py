@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import importlib
 import subprocess
+import stat
+import posixpath
 
 # Paramiko is loaded lazily. If missing, we will auto-install from requirements.txt.
 PARAMIKO_MOD = None  # type: ignore
@@ -753,7 +755,12 @@ def reboot_server(sc: ServerConfig, wait_seconds: Optional[int]) -> int:
     return 0
 
 
-def upload_script(cli: SSHClient, local_script: Path, remote_rel_dir: str = ".sofilab_scripts") -> Path:
+def upload_script(cli: SSHClient, local_script: Path, remote_rel_dir: str = ".sofilab_scripts") -> str:
+    """Upload a local script to the remote host and return its POSIX path as a string.
+
+    Important: Always return a forward-slash path (POSIX), never a Windows Path,
+    to avoid accidental backslash conversion when running commands remotely.
+    """
     sftp = cli.sftp()
     # Ensure remote dir exists
     remote_dir = f"{remote_rel_dir}"
@@ -763,7 +770,187 @@ def upload_script(cli: SSHClient, local_script: Path, remote_rel_dir: str = ".so
         sftp.mkdir(remote_dir)
     remote_path = f"{remote_dir}/{local_script.name}"
     sftp.put(str(local_script), remote_path)
-    return Path(remote_path)
+    # Return string path to preserve forward slashes on Windows
+    return remote_path
+
+
+# --------------------------
+# File transfer helpers (SFTP)
+# --------------------------
+def _sftp_home(sftp) -> str:
+    """Return remote home directory as POSIX path."""
+    try:
+        return sftp.normalize(".")
+    except Exception:
+        return "/"
+
+
+def _sftp_abs(sftp, remote_path: str) -> str:
+    """Normalize a remote path to an absolute POSIX path.
+    - `~` resolves to the SFTP session home
+    - Relative paths are resolved from home
+    """
+    rp = remote_path or "."
+    home = _sftp_home(sftp)
+    if rp.startswith("~"):
+        rp = rp.replace("~", home, 1)
+    if not rp.startswith("/"):
+        rp = posixpath.join(home, rp)
+    # Collapse any ../ or ./
+    parts = []
+    for p in rp.split('/'):
+        if not p or p == '.':
+            continue
+        if p == '..':
+            if parts:
+                parts.pop()
+            continue
+        parts.append(p)
+    return "/" + "/".join(parts)
+
+
+def _is_dir(attrs) -> bool:
+    try:
+        return stat.S_ISDIR(attrs.st_mode)
+    except Exception:
+        return False
+
+
+def sftp_list_directory(cli: SSHClient, remote_dir: str) -> int:
+    sftp = cli.sftp()
+    target = _sftp_abs(sftp, remote_dir or ".")
+    try:
+        attrs = sftp.stat(target)
+    except IOError as e:
+        error(f"Remote path not found: {target} ({e})")
+        return 1
+    if not _is_dir(attrs):
+        # If it's a file, just show that file
+        info("Target is a file; displaying file info")
+        name = posixpath.basename(target)
+        print(f"- {name}")
+        return 0
+
+    print("")
+    print(f"📂 Listing: {target}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    try:
+        entries = sftp.listdir_attr(target)
+    except Exception as e:
+        error(f"Failed to list remote directory: {e}")
+        return 1
+
+    if not entries:
+        print("(empty)")
+        return 0
+
+    for ent in sorted(entries, key=lambda a: a.filename.lower()):
+        size = ent.st_size
+        kind = 'd' if _is_dir(ent) else '-'
+        # Basic columns: type, size, name
+        print(f"{kind} {human_size(size):>7}  {ent.filename}")
+    return 0
+
+
+def _ensure_remote_dir(sftp, remote_dir: str) -> None:
+    """Recursively create directories on remote if missing."""
+    remote_dir = remote_dir.rstrip('/')
+    if not remote_dir or remote_dir == '/':
+        return
+    parts = remote_dir.split('/')
+    path = ''
+    for p in parts:
+        if not p:
+            path = '/'
+            continue
+        path = p if path == '/' else (path + '/' + p) if path else p
+        try:
+            sftp.stat('/' + path if not path.startswith('/') else path)
+        except IOError:
+            try:
+                sftp.mkdir('/' + path if not path.startswith('/') else path)
+            except Exception:
+                pass
+
+
+def download_items(cli: SSHClient, remote_paths: List[str], local_dest: Path, recursive: bool) -> int:
+    sftp = cli.sftp()
+    home = _sftp_home(sftp)
+    local_dest.mkdir(parents=True, exist_ok=True)
+
+    def _download_file(remote_file_abs: str, local_dir: Path) -> None:
+        local_path = local_dir / posixpath.basename(remote_file_abs)
+        sftp.get(remote_file_abs, str(local_path))
+        info(f"Downloaded: {remote_file_abs} -> {local_path}")
+
+    def _walk_dir(remote_dir_abs: str, local_dir: Path):
+        try:
+            entries = sftp.listdir_attr(remote_dir_abs)
+        except Exception as e:
+            warn(f"Skip directory (cannot list): {remote_dir_abs} ({e})")
+            return
+        local_dir.mkdir(parents=True, exist_ok=True)
+        for ent in entries:
+            r_path = posixpath.join(remote_dir_abs, ent.filename)
+            if _is_dir(ent):
+                if recursive:
+                    _walk_dir(r_path, local_dir / ent.filename)
+                else:
+                    info(f"Skip directory (use -r to recurse): {r_path}")
+            else:
+                _download_file(r_path, local_dir)
+
+    any_error = 0
+    for rp in remote_paths:
+        rp_abs = _sftp_abs(sftp, rp)
+        try:
+            attrs = sftp.stat(rp_abs)
+        except IOError as e:
+            error(f"Remote path not found: {rp} ({e})")
+            any_error = 1
+            continue
+        if _is_dir(attrs):
+            _walk_dir(rp_abs, local_dest / posixpath.basename(rp_abs.rstrip('/')))
+        else:
+            _download_file(rp_abs, local_dest)
+
+    return any_error
+
+
+def upload_items(cli: SSHClient, local_paths: List[Path], remote_dest: str, recursive: bool) -> int:
+    sftp = cli.sftp()
+    dest_abs = _sftp_abs(sftp, remote_dest or ".")
+    _ensure_remote_dir(sftp, dest_abs)
+
+    def _upload_file(local_file: Path, dest_dir_abs: str) -> None:
+        remote_path = posixpath.join(dest_dir_abs, local_file.name)
+        sftp.put(str(local_file), remote_path)
+        info(f"Uploaded: {local_file} -> {remote_path}")
+
+    def _walk_local_dir(local_dir: Path, dest_dir_abs: str):
+        # Ensure remote dir exists
+        _ensure_remote_dir(sftp, dest_dir_abs)
+        for entry in local_dir.iterdir():
+            if entry.is_dir():
+                if recursive:
+                    _walk_local_dir(entry, posixpath.join(dest_dir_abs, entry.name))
+                else:
+                    info(f"Skip directory (use -r to recurse): {entry}")
+            elif entry.is_file():
+                _upload_file(entry, dest_dir_abs)
+
+    any_error = 0
+    for lp in local_paths:
+        if not lp.exists():
+            error(f"Local path not found: {lp}")
+            any_error = 1
+            continue
+        if lp.is_dir():
+            _walk_local_dir(lp, posixpath.join(dest_abs, lp.name))
+        else:
+            _upload_file(lp, dest_abs)
+
+    return any_error
 
 
 def detect_remote_shell(cli: SSHClient) -> str:
@@ -776,7 +963,7 @@ def detect_remote_shell(cli: SSHClient) -> str:
         return "bash"
 
 
-def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str) -> int:
+def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str) -> int:
     # Prepare env
     env: Dict[str, str] = {
         "SSH_PORT": str(configured_port),
@@ -800,7 +987,7 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
     shell = detect_remote_shell(cli)
     shell_opts = " -e" if script_exit_on_error else ""
     # chmod +x and execute; then remove the script file, propagate exit code
-    cmd = f"cd ~ && chmod +x {shlex.quote(str(remote_path))} && {shell}{shell_opts} {shlex.quote(str(remote_path))} ; rc=$?; rm -f {shlex.quote(str(remote_path))}; exit $rc"
+    cmd = f"cd ~ && chmod +x {shlex.quote(remote_path)} && {shell}{shell_opts} {shlex.quote(remote_path)} ; rc=$?; rm -f {shlex.quote(remote_path)}; exit $rc"
 
     # Execute, streaming output and logging lines to remote log
     assert cli.client is not None
@@ -830,7 +1017,8 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
                         text = data.decode(errors="ignore")
                         for line in text.splitlines():
                             print(line)
-                            log_remote(alias, remote_path.name, line)
+                            import posixpath as _pp
+                            log_remote(alias, _pp.basename(remote_path), line)
                     if chan.recv_stderr_ready():
                         data = chan.recv_stderr(32768)
                         if not data:
@@ -838,7 +1026,8 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
                         text = data.decode(errors="ignore")
                         for line in text.splitlines():
                             print(line)
-                            log_remote(alias, remote_path.name, line)
+                            import posixpath as _pp
+                            log_remote(alias, _pp.basename(remote_path), line)
                     if chan.exit_status_ready():
                         break
                     time.sleep(0.01)
@@ -883,7 +1072,8 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
                             text = data.decode(errors="ignore")
                             for line in text.splitlines():
                                 print(line)
-                                log_remote(alias, remote_path.name, line)
+                            import posixpath as _pp
+                            log_remote(alias, _pp.basename(remote_path), line)
                         if chan.recv_stderr_ready():
                             data = chan.recv_stderr(32768)
                             if not data:
@@ -891,7 +1081,8 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
                             text = data.decode(errors="ignore")
                             for line in text.splitlines():
                                 print(line)
-                                log_remote(alias, remote_path.name, line)
+                            import posixpath as _pp
+                            log_remote(alias, _pp.basename(remote_path), line)
                     if sys.stdin in rlist:
                         try:
                             data = os.read(sys.stdin.fileno(), 1024)
@@ -909,12 +1100,14 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: Path, c
                             text = chan.recv(32768).decode(errors="ignore")
                             for line in text.splitlines():
                                 print(line)
-                                log_remote(alias, remote_path.name, line)
+                                import posixpath as _pp
+                                log_remote(alias, _pp.basename(remote_path), line)
                         while chan.recv_stderr_ready():
                             text = chan.recv_stderr(32768).decode(errors="ignore")
                             for line in text.splitlines():
                                 print(line)
-                                log_remote(alias, remote_path.name, line)
+                                import posixpath as _pp
+                                log_remote(alias, _pp.basename(remote_path), line)
                         break
             finally:
                 rc = chan.recv_exit_status()
@@ -1274,6 +1467,11 @@ def install_cli() -> int:
                         # Preserve value type if possible
                         reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
                         winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
+                    # Also update process PATH so children can find it right away
+                    try:
+                        os.environ["PATH"] = new_path
+                    except Exception:
+                        pass
                     # Broadcast environment change so new consoles pick it up
                     try:
                         import ctypes
@@ -1328,23 +1526,46 @@ def install_cli() -> int:
             print("If the command is not found, try in this session:")
             print("  $env:Path += ';' + \"$env:LOCALAPPDATA\\SofiLab\\bin\"")
             print("  $env:PATHEXT += ';.CMD;.BAT'")
+            print("Or invoke explicitly this time:")
+            print("  & \"$env:LOCALAPPDATA\\SofiLab\\bin\\sofilab.cmd\" --version")
             return 0
         except Exception as e:
             error(f"Windows installation failed: {e}")
             return 1
-    # POSIX
-    install_dir = Path("/usr/local/bin")
-    dest = install_dir / "sofilab"
+    # POSIX (macOS/Linux)
+    system_bin = Path("/usr/local/bin")
+    dest = system_bin / "sofilab"
     try:
-        install_dir.mkdir(parents=True, exist_ok=True)
+        system_bin.mkdir(parents=True, exist_ok=True)
         if dest.is_symlink() or dest.exists():
             dest.unlink()
         dest.symlink_to(SCRIPT_PATH)
         info("✓ Installation successful! 'sofilab' now points to the Python CLI.")
         return 0
     except PermissionError:
-        error("Insufficient permissions to create symlink in /usr/local/bin. Try with sudo or use manual usage.")
-        return 1
+        # Fallback: install to user bin without sudo
+        user_bin = Path.home() / ".local" / "bin"
+        try:
+            user_bin.mkdir(parents=True, exist_ok=True)
+            user_dest = user_bin / "sofilab"
+            if user_dest.is_symlink() or user_dest.exists():
+                user_dest.unlink()
+            try:
+                user_dest.symlink_to(SCRIPT_PATH)
+            except Exception:
+                # If symlink not allowed, write a tiny wrapper script
+                user_dest.write_text(
+                    f"#!/usr/bin/env bash\nexec \"{sys.executable}\" \"{SCRIPT_PATH}\" \"$@\"\n",
+                    encoding="utf-8",
+                )
+                os.chmod(user_dest, 0o755)
+            info("✓ Installed to user bin: ~/.local/bin/sofilab")
+            print("If not already in PATH, add it:")
+            print("  export PATH=\"$HOME/.local/bin:$PATH\"")
+            return 0
+        except Exception as e:
+            error(f"Failed to install to user bin: {e}")
+            return 1
     except Exception as e:
         error(f"Failed to install: {e}")
         return 1
@@ -1365,21 +1586,53 @@ def uninstall_cli() -> int:
             if wrapper_bat.exists():
                 wrapper_bat.unlink()
                 info("Removed Windows wrapper sofilab.bat")
+            # Attempt to remove path entry from HKCU if present
+            try:
+                import winreg  # type: ignore
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
+                    try:
+                        current_path, reg_type = winreg.QueryValueEx(k, "Path")
+                    except FileNotFoundError:
+                        current_path, reg_type = "", winreg.REG_EXPAND_SZ
+                parts = [p.strip() for p in current_path.split(";") if p.strip()]
+                cleaned = [p for p in parts if Path(p).resolve().as_posix().lower().rstrip("/") != install_dir.resolve().as_posix().lower().rstrip("/")]
+                if cleaned != parts:
+                    new_path = ";".join(cleaned)
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
+                        reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
+                        winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
+                    try:
+                        os.environ["PATH"] = new_path
+                    except Exception:
+                        pass
+                    try:
+                        import ctypes
+                        HWND_BROADCAST = 0xFFFF
+                        WM_SETTINGCHANGE = 0x001A
+                        SMTO_ABORTIFHUNG = 0x0002
+                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             return 0
         except Exception as e:
             error(f"Windows uninstallation failed: {e}")
             return 1
-    dest = Path("/usr/local/bin/sofilab")
-    if dest.exists() or dest.is_symlink():
+    # POSIX cleanup: system and user bins
+    removed_any = False
+    for pth in (Path("/usr/local/bin/sofilab"), Path.home() / ".local" / "bin" / "sofilab"):
         try:
-            dest.unlink()
-            info("Uninstallation successful!")
-            return 0
-        except Exception as e:
-            error(f"Failed to remove symlink: {e}")
-            return 1
+            if pth.exists() or pth.is_symlink():
+                pth.unlink()
+                removed_any = True
+        except Exception:
+            pass
+    if removed_any:
+        info("Uninstallation successful!")
+        return 0
     else:
-        warn("No installation found at /usr/local/bin/sofilab")
+        warn("No installation found in standard locations")
         info("Nothing to uninstall")
         return 0
 
@@ -1424,6 +1677,10 @@ Examples:
   {SCRIPT_NAME} logs remote 100
   {SCRIPT_NAME} clear-logs remote
   {SCRIPT_NAME} install
+  {SCRIPT_NAME} ls-remote pmx ~
+  {SCRIPT_NAME} cp pmx:/var/log/syslog ./logs
+  {SCRIPT_NAME} cp -r pmx:/etc/nginx ./backups
+  {SCRIPT_NAME} cp ./local.txt pmx:~/uploads
 """
 
 
@@ -1476,6 +1733,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_runone.add_argument("--tty", dest="tty", action="store_true")
     p_runone.add_argument("--no-tty", dest="no_tty", action="store_true")
 
+    # File transfer
+    p_ls = sub.add_parser("ls-remote")
+    p_ls.add_argument("alias")
+    p_ls.add_argument("path", nargs="?", default="~")
+
+    p_dl = sub.add_parser("download")
+    p_dl.add_argument("alias")
+    p_dl.add_argument("remote", nargs="+", help="Remote file/dir path(s)")
+    p_dl.add_argument("--dest", "-d", default=".", help="Local destination directory")
+    p_dl.add_argument("-r", "--recursive", action="store_true")
+
+    p_up = sub.add_parser("upload")
+    p_up.add_argument("alias")
+    p_up.add_argument("local", nargs="+", help="Local file/dir path(s)")
+    p_up.add_argument("--dest", "-d", default="~", help="Remote destination directory")
+    p_up.add_argument("-r", "--recursive", action="store_true")
+
+    # Unified transfer (scp-like)
+    p_cp = sub.add_parser("cp", help="Copy files between local and remote using alias:/path notation")
+    p_cp.add_argument("src", nargs="+", help="Source path(s). Use alias:/path for remote")
+    p_cp.add_argument("dest", help="Destination. Use alias:/path for remote")
+    p_cp.add_argument("-r", "--recursive", action="store_true")
+
     parser.add_argument("--version", "-V", action="store_true", help="Show version and exit")
 
     if not argv:
@@ -1515,6 +1795,86 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "clear-logs":
         return clear_logs(gcfg, args.type)
 
+    # Unified cp is handled before host-required commands
+    if args.cmd == "cp":
+        def _classify(ep: str):
+            if ":" in ep:
+                a, p = ep.split(":", 1)
+                if a in servers:
+                    return ("remote", a, p)
+            return ("local", None, ep)
+
+        srcs = [ _classify(s) for s in args.src ]
+        dest_t = _classify(args.dest)
+
+        src_remote_aliases = {a for t,a,_ in srcs if t == "remote"}
+        src_has_remote = any(t == "remote" for t,_,_ in srcs)
+        dest_is_remote = dest_t[0] == "remote"
+
+        if src_has_remote and dest_is_remote:
+            error("Remote-to-remote copy is not supported")
+            return 1
+        if not src_has_remote and not dest_is_remote:
+            error("Local-to-local copy is not supported; at least one side must be remote")
+            return 1
+        if src_has_remote and len(src_remote_aliases) > 1:
+            error("Sources span multiple remote aliases; copy one host at a time")
+            return 1
+
+        # Determine direction and alias
+        if src_has_remote:
+            # download: remote sources -> local dest
+            alias = next(iter(src_remote_aliases))
+            sc = servers.get(alias)
+            if not sc:
+                error(f"Unknown host-alias: {alias}")
+                return 1
+            port = determine_ssh_port(sc.port, sc.host)
+            if not port:
+                return 1
+            keyfile = get_ssh_keyfile(sc)
+            try:
+                cli = SSHClient(sc.host, port, sc.user, sc.password, keyfile)
+                cli.connect(timeout=5)
+                remote_paths = [p for t,_,p in srcs if t == "remote"]
+                local_dest = Path(dest_t[2]).expanduser().resolve()
+                info("Note: use 'cp -r' to transfer directories recursively")
+                return download_items(cli, remote_paths, local_dest, args.recursive)
+            except Exception as e:
+                error(f"SFTP error: {e}")
+                return 1
+            finally:
+                try:
+                    cli.close()  # type: ignore
+                except Exception:
+                    pass
+        else:
+            # upload: local sources -> remote dest
+            alias = dest_t[1]
+            sc = servers.get(alias) if alias else None
+            if not sc:
+                error(f"Unknown host-alias: {alias}")
+                return 1
+            port = determine_ssh_port(sc.port, sc.host)
+            if not port:
+                return 1
+            keyfile = get_ssh_keyfile(sc)
+            try:
+                cli = SSHClient(sc.host, port, sc.user, sc.password, keyfile)
+                cli.connect(timeout=5)
+                local_paths = [Path(p).expanduser().resolve() for t,_,p in srcs if t == "local"]
+                remote_dest = dest_t[2]
+                info("Note: use 'cp -r' to transfer directories recursively")
+                return upload_items(cli, local_paths, remote_dest, args.recursive)
+            except Exception as e:
+                error(f"SFTP error: {e}")
+                return 1
+            finally:
+                try:
+                    cli.close()  # type: ignore
+                except Exception:
+                    pass
+
     # Host-required commands
     if not getattr(args, "alias", None):
         error("Host-alias required for this command")
@@ -1548,6 +1908,61 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_scripts(sc, gcfg, alias)
     if args.cmd == "run-script":
         return run_single_script(sc, gcfg, alias, args.script)
+    if args.cmd == "ls-remote":
+        port = determine_ssh_port(sc.port, sc.host)
+        if not port:
+            return 1
+        keyfile = get_ssh_keyfile(sc)
+        try:
+            cli = SSHClient(sc.host, port, sc.user, sc.password, keyfile)
+            cli.connect(timeout=5)
+            return sftp_list_directory(cli, args.path)
+        except Exception as e:
+            error(f"SFTP error: {e}")
+            return 1
+        finally:
+            try:
+                cli.close()  # type: ignore
+            except Exception:
+                pass
+    if args.cmd == "download":
+        warn("'download' is deprecated. Use: sofilab cp alias:/path ... <local_dir>")
+        port = determine_ssh_port(sc.port, sc.host)
+        if not port:
+            return 1
+        keyfile = get_ssh_keyfile(sc)
+        try:
+            cli = SSHClient(sc.host, port, sc.user, sc.password, keyfile)
+            cli.connect(timeout=5)
+            dest = Path(args.dest).expanduser().resolve()
+            return download_items(cli, args.remote, dest, args.recursive)
+        except Exception as e:
+            error(f"SFTP error: {e}")
+            return 1
+        finally:
+            try:
+                cli.close()  # type: ignore
+            except Exception:
+                pass
+    if args.cmd == "upload":
+        warn("'upload' is deprecated. Use: sofilab cp <local...> alias:/dest")
+        port = determine_ssh_port(sc.port, sc.host)
+        if not port:
+            return 1
+        keyfile = get_ssh_keyfile(sc)
+        try:
+            cli = SSHClient(sc.host, port, sc.user, sc.password, keyfile)
+            cli.connect(timeout=5)
+            locals_list = [Path(p).expanduser().resolve() for p in args.local]
+            return upload_items(cli, locals_list, args.dest, args.recursive)
+        except Exception as e:
+            error(f"SFTP error: {e}")
+            return 1
+        finally:
+            try:
+                cli.close()  # type: ignore
+            except Exception:
+                pass
 
     error(f"Unknown command: {args.cmd}")
     parser.print_help()
