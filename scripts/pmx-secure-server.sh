@@ -327,6 +327,63 @@ fw_restart_firewall() {
   log "✓ Firewall rules reloaded"
 }
 
+# Allow ICMP ping from the Proxmox node (outgoing) and replies (incoming)
+fw_ensure_icmp_ping_allowed() {
+  local fw_file="/etc/pve/firewall/cluster.fw"
+
+  # Ensure config exists and firewall enabled
+  if [[ ! -f "$fw_file" ]]; then
+    cat > "$fw_file" <<EOF
+[OPTIONS]
+enable: 1
+
+[RULES]
+EOF
+    log "Created datacenter firewall configuration"
+  else
+    if grep -q "^enable: 0" "$fw_file" 2>/dev/null; then
+      sed -i 's/^enable: 0/enable: 1/' "$fw_file"
+      log "✓ Enabled firewall in configuration"
+    elif ! grep -q "^enable:" "$fw_file" 2>/dev/null; then
+      if grep -q "^\[OPTIONS\]" "$fw_file"; then
+        sed -i "/^\[OPTIONS\]/a enable: 1" "$fw_file"
+      else
+        sed -i "1i [OPTIONS]\nenable: 1\n" "$fw_file"
+      fi
+      log "✓ Added enable option to firewall configuration"
+    fi
+  fi
+
+  # Ensure [RULES] section exists
+  if ! grep -q "^\[RULES\]" "$fw_file"; then
+    echo "" >> "$fw_file"
+    echo "[RULES]" >> "$fw_file"
+  fi
+
+  # Simplify: allow all ICMP in and out (covers echo-request/echo-reply)
+  # First, remove any older specific echo-request/echo-reply rules we may have added
+  if grep -Eq "^IN[[:space:]]+ACCEPT[[:space:]]+-p[[:space:]]+icmp[[:space:]]+-icmp-type[[:space:]]+(echo-request|echo-reply)" "$fw_file"; then
+    sed -i "/^IN[[:space:]]\+ACCEPT[[:space:]]\+-p[[:space:]]\+icmp[[:space:]]\+-icmp-type[[:space:]]\+\(echo-request\|echo-reply\)/d" "$fw_file"
+    log "✓ Removed legacy ICMP echo-type specific rules"
+  fi
+
+  # Ensure generic OUT rule exists
+  if ! grep -Eq "^OUT[[:space:]]+ACCEPT[[:space:]]+-p[[:space:]]+icmp([[:space:]]|$)" "$fw_file"; then
+    sed -i "/^\[RULES\]/a OUT ACCEPT -p icmp # Allow outgoing ICMP" "$fw_file"
+    log "✓ Added firewall rule: OUT ACCEPT -p icmp"
+  else
+    log "✓ Firewall rule exists: OUT ACCEPT -p icmp"
+  fi
+
+  # Ensure generic IN rule exists
+  if ! grep -Eq "^IN[[:space:]]+ACCEPT[[:space:]]+-p[[:space:]]+icmp([[:space:]]|$)" "$fw_file"; then
+    sed -i "/^\[RULES\]/a IN ACCEPT -p icmp # Allow incoming ICMP" "$fw_file"
+    log "✓ Added firewall rule: IN ACCEPT -p icmp"
+  else
+    log "✓ Firewall rule exists: IN ACCEPT -p icmp"
+  fi
+}
+
 test_and_restart_sshd_or_restore() {
   if sshd -t 2>/dev/null; then
     log "✓ SSH configuration is valid"
@@ -491,6 +548,9 @@ fw_enable_datacenter
 fw_cleanup_duplicates
 fw_ensure_rule_exists "8006" "Proxmox-WebUI"
 fw_ensure_rule_exists "$SSH_LISTEN_PORT" "SSH-Custom-Port"
+
+# Allow the node to ping out and receive replies
+fw_ensure_icmp_ping_allowed
 
 if [[ "$SSH_LISTEN_PORT" != "22" ]]; then
   log "Removing any rules for port 22 (since SSH moved to $SSH_LISTEN_PORT)..."

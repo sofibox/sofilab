@@ -437,10 +437,14 @@ class SSHClient:
         return self.client.open_sftp()
 
     def interactive_shell(self) -> None:
-        """Very simple interactive shell. Attempts to be cross-platform.
+        """Interactive shell bridging local TTY <-> remote PTY.
+        On POSIX, switch local TTY to raw mode so line editing keys work
+        (arrows, backspace, Ctrl-C, etc.), then restore on exit.
         """
         assert self.client is not None
-        chan = self.client.invoke_shell(term=os.environ.get("TERM", "xterm"))
+        # Prefer 256-color term if available; fall back to xterm
+        term_name = os.environ.get("TERM") or "xterm-256color"
+        chan = self.client.invoke_shell(term=term_name)
 
         # Try to set window size if we can (POSIX only)
         try:
@@ -493,8 +497,31 @@ class SSHClient:
                 except Exception:
                     pass
         else:
-            # POSIX: select on stdin + channel
+            # POSIX: put local TTY into raw mode and bridge bytes
+            import termios, tty, signal
+
+            fd = sys.stdin.fileno()
+            old_attrs = None
+
+            # Handle window resize: propagate to remote PTY
+            def _on_winch(_sig, _frm):
+                try:
+                    import fcntl, struct, termios as _t
+                    s = struct.pack('HHHH', 0, 0, 0, 0)
+                    r = fcntl.ioctl(fd, _t.TIOCGWINSZ, s)
+                    rows, cols, _, _ = struct.unpack('HHHH', r)
+                    try:
+                        chan.resize_pty(width=cols, height=rows)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
             try:
+                if sys.stdin.isatty():
+                    old_attrs = termios.tcgetattr(fd)
+                    tty.setraw(fd)
+                    signal.signal(signal.SIGWINCH, _on_winch)
                 while True:
                     rlist, _, _ = select.select([chan, sys.stdin], [], [])
                     if chan in rlist:
@@ -504,13 +531,24 @@ class SSHClient:
                         sys.stdout.write(data.decode(errors="ignore"))
                         sys.stdout.flush()
                     if sys.stdin in rlist:
-                        data = os.read(sys.stdin.fileno(), 1024)
+                        try:
+                            data = os.read(fd, 1024)
+                        except Exception:
+                            data = b""
                         if not data:
                             break
-                        chan.send(data)
+                        try:
+                            chan.send(data)
+                        except Exception:
+                            break
             except KeyboardInterrupt:
                 pass
             finally:
+                if old_attrs is not None:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                    except Exception:
+                        pass
                 try:
                     chan.close()
                 except Exception:
