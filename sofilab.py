@@ -1210,6 +1210,13 @@ def install_cli() -> int:
                 f"\"{py}\" \"{script}\" %*\r\n",
                 encoding="utf-8"
             )
+            # Also create a .bat wrapper for shells relying on .BAT
+            wrapper_bat = install_dir / "sofilab.bat"
+            wrapper_bat.write_text(
+                "@echo off\r\n"
+                f"\"{py}\" \"{script}\" %*\r\n",
+                encoding="utf-8"
+            )
 
             # Add install_dir to the user's PATH in HKCU\Environment
             try:
@@ -1243,9 +1250,46 @@ def install_cli() -> int:
                 # Non-fatal if PATH update fails; wrapper still created
                 pass
 
+            # Ensure PATHEXT contains .CMD and .BAT for extensionless invocation
+            try:
+                import winreg  # type: ignore
+                # Get existing from user or process
+                user_pathext = None
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
+                        user_pathext, pe_type = winreg.QueryValueEx(k, "PATHEXT")
+                except FileNotFoundError:
+                    pe_type = None
+                    user_pathext = os.environ.get("PATHEXT", "")
+                pathext_parts = [p.strip().upper() for p in (user_pathext or "").split(";") if p.strip()]
+                changed = False
+                for ext in (".CMD", ".BAT"):
+                    if ext not in pathext_parts:
+                        pathext_parts.append(ext)
+                        changed = True
+                if changed:
+                    new_pathext = ";".join(pathext_parts)
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
+                        winreg.SetValueEx(k, "PATHEXT", 0, winreg.REG_EXPAND_SZ, new_pathext)
+                    os.environ["PATHEXT"] = new_pathext
+                    try:
+                        import ctypes
+                        HWND_BROADCAST = 0xFFFF
+                        WM_SETTINGCHANGE = 0x001A
+                        SMTO_ABORTIFHUNG = 0x0002
+                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                                                                 "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             info("✓ Installation successful! Open a new terminal to use 'sofilab'.")
             print(f"Installed wrapper: {wrapper}")
             print(f"Added to PATH (if needed): {install_dir}")
+            print("If the command is not found, try in this session:")
+            print("  $env:Path += ';' + \"$env:LOCALAPPDATA\\SofiLab\\bin\"")
+            print("  $env:PATHEXT += ';.CMD;.BAT'")
             return 0
         except Exception as e:
             error(f"Windows installation failed: {e}")
@@ -1274,11 +1318,15 @@ def uninstall_cli() -> int:
             local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
             install_dir = Path(local_app) / "SofiLab" / "bin"
             wrapper = install_dir / "sofilab.cmd"
+            wrapper_bat = install_dir / "sofilab.bat"
             if wrapper.exists():
                 wrapper.unlink()
                 info("Removed Windows wrapper sofilab.cmd")
             else:
                 warn("No Windows wrapper found to remove")
+            if wrapper_bat.exists():
+                wrapper_bat.unlink()
+                info("Removed Windows wrapper sofilab.bat")
             return 0
         except Exception as e:
             error(f"Windows uninstallation failed: {e}")
