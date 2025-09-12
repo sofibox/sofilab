@@ -816,8 +816,33 @@ def _is_dir(attrs) -> bool:
         return False
 
 
+def _list_remote_shell(cli: SSHClient, remote_dir: str) -> int:
+    # Fallback listing via remote shell when SFTP subsystem is unavailable (e.g., Dropbear).
+    # Prefer predictable output; BusyBox supports -al in most builds.
+    token = (remote_dir or "~").strip()
+    if token.startswith("~"):
+        # Allow shell to expand ~ by not quoting it
+        arg = token
+    else:
+        arg = shlex.quote(token)
+    code, out, err = cli.run(f"sh -lc 'ls -al -- {arg}'", timeout=15)
+    if code != 0:
+        error(f"Remote ls failed (exit {code}): {err.strip() or out.strip()}")
+        return 1
+    print("")
+    print(f"📂 Listing (shell): {token}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    sys.stdout.write(out)
+    return 0
+
+
 def sftp_list_directory(cli: SSHClient, remote_dir: str) -> int:
-    sftp = cli.sftp()
+    try:
+        sftp = cli.sftp()
+    except Exception as e:
+        warn(f"SFTP not available on server ({e}); falling back to shell ls")
+        return _list_remote_shell(cli, remote_dir)
+
     target = _sftp_abs(sftp, remote_dir or ".")
     try:
         attrs = sftp.stat(target)
@@ -837,8 +862,8 @@ def sftp_list_directory(cli: SSHClient, remote_dir: str) -> int:
     try:
         entries = sftp.listdir_attr(target)
     except Exception as e:
-        error(f"Failed to list remote directory: {e}")
-        return 1
+        warn(f"SFTP list failed ({e}); falling back to shell ls")
+        return _list_remote_shell(cli, remote_dir)
 
     if not entries:
         print("(empty)")
