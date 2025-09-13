@@ -38,11 +38,23 @@ import posixpath
 PARAMIKO_MOD = None  # type: ignore
 
 def ensure_paramiko():
+    """Return a working paramiko module or raise with a clear message.
+
+    Handles environments where a shadowing module exists or a partial install
+    returns an invalid object. Attempts auto-install/repair once.
+    """
     global PARAMIKO_MOD
     if PARAMIKO_MOD is not None:
         return PARAMIKO_MOD
+
+    def _import_paramiko():
+        mod = importlib.import_module("paramiko")
+        if mod is None or not hasattr(mod, "SSHClient"):
+            raise ImportError("paramiko imported but invalid (missing SSHClient)")
+        return mod
+
     try:
-        PARAMIKO_MOD = importlib.import_module("paramiko")
+        PARAMIKO_MOD = _import_paramiko()
         return PARAMIKO_MOD
     except Exception:
         # Try to install dependencies automatically
@@ -55,14 +67,75 @@ def ensure_paramiko():
             cmd += ["paramiko>=3.4.0"]
             print("Installing Python dependency: paramiko...", file=sys.stderr)
         try:
+            try:
+                # Remove any preloaded/invalid module
+                if "paramiko" in sys.modules:
+                    del sys.modules["paramiko"]
+            except Exception:
+                pass
             subprocess.check_call(cmd)
         except Exception as e:
             print(f"❌ Failed to install dependencies automatically: {e}", file=sys.stderr)
-            print("Please run: pip install -r requirements.txt", file=sys.stderr)
+            print("Please run: python -m pip install paramiko>=3.4.0", file=sys.stderr)
             raise
-        # Import again
-        PARAMIKO_MOD = importlib.import_module("paramiko")
+        PARAMIKO_MOD = _import_paramiko()
         return PARAMIKO_MOD
+
+
+# --------------------------
+# Windows helpers
+# --------------------------
+def _win_local_appdata() -> Optional[Path]:
+    """Return LocalAppData path using Win32 API for robustness on Windows.
+    Falls back to environment variable or user home if needed.
+    """
+    if os.name != 'nt':
+        return None
+    # Try Win32 SHGetKnownFolderPath(FOLDERID_LocalAppData)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # FOLDERID_LocalAppData {F1B32785-6FBA-4FCF-9D55-7B8E7F157091}
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        FOLDERID_LocalAppData = GUID(0xF1B32785, 0x6FBA, 0x4FCF, (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91))
+
+        SHGetKnownFolderPath = ctypes.windll.shell32.SHGetKnownFolderPath
+        SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+        SHGetKnownFolderPath.restype = ctypes.c_long
+
+        path_ptr = ctypes.c_wchar_p()
+        # Flags = 0 (default). Token = None (current user)
+        hr = SHGetKnownFolderPath(ctypes.byref(FOLDERID_LocalAppData), 0, None, ctypes.byref(path_ptr))
+        if hr == 0 and path_ptr.value:
+            try:
+                return Path(path_ptr.value)
+            finally:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Fallbacks
+    try:
+        env = os.environ.get("LOCALAPPDATA")
+        if env:
+            return Path(env)
+    except Exception:
+        pass
+    try:
+        return Path.home() / "AppData" / "Local"
+    except Exception:
+        return None
 
 # --------------------------
 # Metadata
@@ -1451,30 +1524,60 @@ def reset_hostkey(sc: ServerConfig) -> int:
 def install_cli() -> int:
     # Always install the Python CLI as the main command
     if os.name == "nt":
-        # Windows: create a per-user bin directory, write a wrapper, and add it to PATH
+        # Windows: create per-user wrappers, try multiple locations, and add to PATH
         try:
-            local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-            install_dir = Path(local_app) / "SofiLab" / "bin"
-            install_dir.mkdir(parents=True, exist_ok=True)
+            created: List[Path] = []
 
-            wrapper = install_dir / "sofilab.cmd"
-            # Use the current Python executable to avoid relying on PATH
-            py = sys.executable
+            # Primary location: robust LocalAppData
+            la = _win_local_appdata()
+            primary_dir = (la if la else (Path.home() / "AppData" / "Local")) / "SofiLab" / "bin"
+
+            py = sys.executable  # Use current Python interpreter
             script = str(SCRIPT_PATH)
-            wrapper.write_text(
-                "@echo off\r\n"
-                f"\"{py}\" \"{script}\" %*\r\n",
-                encoding="utf-8"
-            )
-            # Also create a .bat wrapper for shells relying on .BAT
-            wrapper_bat = install_dir / "sofilab.bat"
-            wrapper_bat.write_text(
-                "@echo off\r\n"
-                f"\"{py}\" \"{script}\" %*\r\n",
-                encoding="utf-8"
-            )
 
-            # Add install_dir to the user's PATH in HKCU\Environment
+            def write_wrappers(target_dir: Path) -> List[Path]:
+                made: List[Path] = []
+                target_dir.mkdir(parents=True, exist_ok=True)
+                # .cmd wrapper
+                w_cmd = target_dir / "sofilab.cmd"
+                w_cmd.write_text("@echo off\r\n" f"\"{py}\" \"{script}\" %*\r\n", encoding="utf-8")
+                made.append(w_cmd)
+                # .bat wrapper (for some shells)
+                w_bat = target_dir / "sofilab.bat"
+                w_bat.write_text("@echo off\r\n" f"\"{py}\" \"{script}\" %*\r\n", encoding="utf-8")
+                made.append(w_bat)
+                # .ps1 wrapper (PowerShell-friendly shim)
+                w_ps1 = target_dir / "sofilab.ps1"
+                w_ps1.write_text(
+                    "# SofiLab PowerShell shim\n"
+                    "$ErrorActionPreference = 'Stop'\n"
+                    f"& \"{py}\" \"{script}\" @args\n",
+                    encoding="utf-8",
+                )
+                made.append(w_ps1)
+                return made
+
+            # Write wrappers only to the SofiLab user bin
+            try:
+                created.extend(write_wrappers(primary_dir))
+            except Exception as e:
+                warn(f"Could not write wrappers to {primary_dir}: {e}")
+
+            # Verify at least one wrapper exists
+            created = [p for p in created if p.exists()]
+            if not created:
+                # Final fallback: try explicit %USERPROFILE%\AppData\Local path
+                try:
+                    up_dir = Path.home() / "AppData" / "Local" / "SofiLab" / "bin"
+                    created.extend(write_wrappers(up_dir))
+                except Exception as e:
+                    warn(f"Could not write wrappers to {up_dir}: {e}")
+                created = [p for p in created if p.exists()]
+                if not created:
+                    error("Failed to create any wrapper files in user locations.")
+                    return 1
+
+            # Add primary_dir to PATH in HKCU if missing
             try:
                 import winreg  # type: ignore
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
@@ -1482,47 +1585,48 @@ def install_cli() -> int:
                         current_path, reg_type = winreg.QueryValueEx(k, "Path")
                     except FileNotFoundError:
                         current_path, reg_type = "", winreg.REG_EXPAND_SZ
-                # Normalize and check membership
-                parts = [p.strip() for p in current_path.split(";") if p.strip()]
-                norm_parts = {p.lower().rstrip("\\/") for p in parts}
-                norm_target = str(install_dir).lower().rstrip("\\/")
-                if norm_target not in norm_parts:
-                    new_path = (";".join(parts + [str(install_dir)])).strip(";")
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
-                        # Preserve value type if possible
-                        reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
-                        winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
-                    # Also update process PATH so children can find it right away
-                    try:
-                        os.environ["PATH"] = new_path
-                    except Exception:
-                        pass
-                    # Broadcast environment change so new consoles pick it up
-                    try:
-                        import ctypes
-                        HWND_BROADCAST = 0xFFFF
-                        WM_SETTINGCHANGE = 0x001A
-                        SMTO_ABORTIFHUNG = 0x0002
-                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-                                                                 "Environment", SMTO_ABORTIFHUNG, 5000, None)
-                    except Exception:
-                        pass
+                parts = [p for p in (current_path or "").split(";") if p]
+                norm = lambda s: s.strip().lower().rstrip("\\/")
+                norm_parts = [norm(p) for p in parts]
+                target_norm = norm(str(primary_dir))
+
+                # Build new PATH with SofiLab prepended, removing duplicates
+                new_parts: List[str] = []
+                new_parts.append(str(primary_dir))
+                for p in parts:
+                    if norm(p) == target_norm:
+                        continue
+                    new_parts.append(p)
+
+                new_path = ";".join([s.strip().strip(';') for s in new_parts if s]).strip(';')
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
+                    reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
+                    winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
+                try:
+                    os.environ["PATH"] = new_path
+                except Exception:
+                    pass
+                try:
+                    import ctypes
+                    HWND_BROADCAST = 0xFFFF
+                    WM_SETTINGCHANGE = 0x001A
+                    SMTO_ABORTIFHUNG = 0x0002
+                    ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                except Exception:
+                    pass
             except Exception:
-                # Non-fatal if PATH update fails; wrapper still created
                 pass
 
-            # Ensure PATHEXT contains .CMD and .BAT for extensionless invocation
+            # Ensure PATHEXT contains .CMD and .BAT
             try:
                 import winreg  # type: ignore
-                # Get existing from user or process
-                user_pathext = None
                 try:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
                         user_pathext, pe_type = winreg.QueryValueEx(k, "PATHEXT")
                 except FileNotFoundError:
                     pe_type = None
                     user_pathext = os.environ.get("PATHEXT", "")
-                pathext_parts = [p.strip().upper() for p in (user_pathext or "").split(";") if p.strip()]
+                pathext_parts = [p.strip().strip('"').upper() for p in (user_pathext or "").split(";") if p]
                 changed = False
                 for ext in (".CMD", ".BAT"):
                     if ext not in pathext_parts:
@@ -1538,21 +1642,30 @@ def install_cli() -> int:
                         HWND_BROADCAST = 0xFFFF
                         WM_SETTINGCHANGE = 0x001A
                         SMTO_ABORTIFHUNG = 0x0002
-                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-                                                                 "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
                     except Exception:
                         pass
             except Exception:
                 pass
 
             info("✓ Installation successful! Open a new terminal to use 'sofilab'.")
-            print(f"Installed wrapper: {wrapper}")
-            print(f"Added to PATH (if needed): {install_dir}")
+            # Print locations we wrote to
+            unique_dirs = sorted({p.parent for p in created}, key=lambda p: str(p).lower())
+            for d in unique_dirs:
+                print(f"Installed wrappers in: {d}")
             print("If the command is not found, try in this session:")
             print("  $env:Path += ';' + \"$env:LOCALAPPDATA\\SofiLab\\bin\"")
             print("  $env:PATHEXT += ';.CMD;.BAT'")
-            print("Or invoke explicitly this time:")
+            print("Or invoke explicitly once:")
             print("  & \"$env:LOCALAPPDATA\\SofiLab\\bin\\sofilab.cmd\" --version")
+            print("PowerShell shim is also available:")
+            print("  & \"$env:LOCALAPPDATA\\SofiLab\\bin\\sofilab.ps1\" --version")
+            # Also show absolute path to one concrete wrapper we created
+            try:
+                first = sorted(created, key=lambda p: (str(p).lower()))[0]
+                print(f"Direct wrapper path: {first}")
+            except Exception:
+                pass
             return 0
         except Exception as e:
             error(f"Windows installation failed: {e}")
@@ -1603,6 +1716,7 @@ def uninstall_cli() -> int:
             install_dir = Path(local_app) / "SofiLab" / "bin"
             wrapper = install_dir / "sofilab.cmd"
             wrapper_bat = install_dir / "sofilab.bat"
+            wrapper_ps1 = install_dir / "sofilab.ps1"
             if wrapper.exists():
                 wrapper.unlink()
                 info("Removed Windows wrapper sofilab.cmd")
@@ -1611,6 +1725,9 @@ def uninstall_cli() -> int:
             if wrapper_bat.exists():
                 wrapper_bat.unlink()
                 info("Removed Windows wrapper sofilab.bat")
+            if wrapper_ps1.exists():
+                wrapper_ps1.unlink()
+                info("Removed Windows wrapper sofilab.ps1")
             # Attempt to remove path entry from HKCU if present
             try:
                 import winreg  # type: ignore
@@ -1660,6 +1777,148 @@ def uninstall_cli() -> int:
         warn("No installation found in standard locations")
         info("Nothing to uninstall")
         return 0
+
+
+# --------------------------
+# Doctor / Diagnostics
+# --------------------------
+def doctor_cli(repair_path: bool = False) -> int:
+    """Diagnose installation on Windows and POSIX; repair wrappers on Windows."""
+    print("")
+    print("🔎 SofiLab Doctor")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Platform: {os.name}  Python: {sys.version.split()[0]}")
+    print(f"Script: {SCRIPT_PATH}")
+
+    if os.name == "nt":
+        la = _win_local_appdata()
+        primary_dir = ((la if la else (Path.home() / "AppData" / "Local"))) / "SofiLab" / "bin"
+        paths = [primary_dir]
+        try:
+            import sysconfig
+            sp = sysconfig.get_path("scripts")
+            if sp:
+                paths.append(Path(sp))
+        except Exception:
+            pass
+        print("Candidate install directories:")
+        for p in paths:
+            print(f"  - {p}")
+
+        found_any = False
+        for p in paths:
+            for name in ("sofilab.cmd", "sofilab.bat", "sofilab.ps1"):
+                fp = p / name
+                if fp.exists():
+                    print(f"✓ Found: {fp}")
+                    found_any = True
+        if not found_any:
+            print("⚠️  No wrappers found. Attempting to (re)create wrappers...")
+            try:
+                # Reuse installer logic to write wrappers
+                install_cli()
+            except Exception as e:
+                error(f"Repair failed: {e}")
+                return 1
+            print("Re-run 'doctor' to confirm, or open a new shell and try 'sofilab --version'.")
+            return 0
+
+        print("")
+        print("PATH entries containing SofiLab/Scripts:")
+        for part in os.environ.get("PATH", "").split(";"):
+            if "SofiLab\\bin" in part or part.lower().endswith("\\scripts"):
+                print(f"  - {part}")
+
+        # Analyze PATH for problematic segments (quotes/unicode/empties)
+        print("")
+        print("PATH sanity scan:")
+        path_str = os.environ.get("PATH", "")
+        segments = path_str.split(";")
+        def has_unmatched_quote(s: str) -> bool:
+            return s.count('"') % 2 != 0
+        any_issue = False
+        for idx, seg in enumerate(segments):
+            s = seg.strip()
+            if not s:
+                continue
+            issues = []
+            if '"' in s:
+                issues.append("contains quote(s)")
+            if has_unmatched_quote(s):
+                issues.append("unmatched quote")
+            try:
+                exists = Path(s.strip('"')).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                issues.append("not found")
+            if issues:
+                any_issue = True
+                print(f"  [{idx}] {s}  ->  {'; '.join(issues)}")
+        if not any_issue:
+            print("  (no obvious issues found)")
+
+        if any_issue and repair_path:
+            print("")
+            print("Attempting PATH repair (user PATH only)...")
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as k:
+                    try:
+                        current_path, reg_type = winreg.QueryValueEx(k, "Path")
+                    except FileNotFoundError:
+                        current_path, reg_type = "", winreg.REG_EXPAND_SZ
+                parts = [p for p in (current_path or "").split(";") if p]
+                def clean(seg: str) -> str:
+                    s = seg.strip().strip('"').strip()
+                    # Collapse inner stray quotes
+                    return s.replace('"', '')
+                cleaned = [clean(p) for p in parts if clean(p)]
+                # Deduplicate, preserve order
+                seen = set()
+                dedup: List[str] = []
+                for p in cleaned:
+                    key = p.lower().rstrip('\\/')
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    dedup.append(p)
+                # Ensure SofiLab bin is first
+                la = _win_local_appdata()
+                sofidir = ((la if la else (Path.home() / "AppData" / "Local")) / "SofiLab" / "bin").resolve()
+                sofikey = str(sofidir).lower().rstrip('\\/')
+                dedup = [str(sofidir)] + [p for p in dedup if p.lower().rstrip('\\/') != sofikey]
+                new_path = ";".join(dedup).strip(';')
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
+                    reg_type_out = reg_type if reg_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else winreg.REG_EXPAND_SZ
+                    winreg.SetValueEx(k, "Path", 0, reg_type_out, new_path)
+                os.environ["PATH"] = new_path
+                try:
+                    import ctypes
+                    HWND_BROADCAST = 0xFFFF
+                    WM_SETTINGCHANGE = 0x001A
+                    SMTO_ABORTIFHUNG = 0x0002
+                    ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
+                except Exception:
+                    pass
+                print("✓ Rewrote user PATH to a sanitized value.")
+                print("Open a new PowerShell/cmd and try: sofilab --version")
+            except Exception as e:
+                error(f"PATH repair failed: {e}")
+        print("")
+        print("PATHEXT:")
+        print(f"  {os.environ.get('PATHEXT', '')}")
+        print("")
+        print("Try now:")
+        print("  sofilab --version")
+        return 0
+
+    # POSIX
+    print("Install locations checked:")
+    for p in (Path("/usr/local/bin/sofilab"), Path.home() / ".local" / "bin" / "sofilab"):
+        print(f"  - {p}: {'present' if p.exists() or p.is_symlink() else 'missing'}")
+    print("Try: sofilab --version")
+    return 0
 
 
 # --------------------------
@@ -1723,6 +1982,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Simple commands
     sub.add_parser("install")
     sub.add_parser("uninstall")
+    # Diagnostics
+    p_doc = sub.add_parser("doctor", help="Diagnose and repair installation issues on this system")
+    p_doc.add_argument("--repair-path", action="store_true", help="Sanitize and rewrite the user PATH if issues are found")
     logs_p = sub.add_parser("logs")
     logs_p.add_argument("type", nargs="?", default="main")
     logs_p.add_argument("lines", nargs="?", type=int, default=50)
@@ -1804,6 +2066,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Version: {VERSION}")
         print(f"Build: {BUILD_DATE}")
         print("Features: SSH connections, server monitoring, installation management")
+        print(f"Author: {AUTHOR}")
         return 0
 
     # Init logging
@@ -1815,6 +2078,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return install_cli()
     if args.cmd == "uninstall":
         return uninstall_cli()
+    if args.cmd == "doctor":
+        return doctor_cli(repair_path=getattr(args, "repair_path", False))
     if args.cmd == "logs":
         return show_logs(gcfg, args.type, args.lines)
     if args.cmd == "clear-logs":
