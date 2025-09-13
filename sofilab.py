@@ -1762,18 +1762,80 @@ def uninstall_cli() -> int:
             error(f"Windows uninstallation failed: {e}")
             return 1
     # POSIX cleanup: system and user bins
-    removed_any = False
-    for pth in (Path("/usr/local/bin/sofilab"), Path.home() / ".local" / "bin" / "sofilab"):
+    removed: List[Path] = []
+    not_removed: List[Tuple[Path, str]] = []
+    candidates = [Path("/usr/local/bin/sofilab"), Path.home() / ".local" / "bin" / "sofilab"]
+    # Also scan PATH for any shims that point back to this repo's script
+    try:
+        path_dirs = [Path(p) for p in os.environ.get("PATH", "").split(":") if p]
+        for d in path_dirs:
+            p = d / "sofilab"
+            if p in candidates:
+                continue
+            if p.exists():
+                candidates.append(p)
+    except Exception:
+        pass
+
+    for pth in candidates:
         try:
-            if pth.exists() or pth.is_symlink():
-                pth.unlink()
-                removed_any = True
+            if not (pth.exists() or pth.is_symlink()):
+                continue
+            # Determine if it's safe to remove
+            remove_ok = False
+            try:
+                if pth.as_posix() in {"/usr/local/bin/sofilab", str((Path.home()/".local"/"bin"/"sofilab").as_posix())}:
+                    # Known locations installed by us
+                    remove_ok = True
+                elif pth.is_symlink():
+                    tgt = pth.resolve()
+                    # Remove if it points to this script or to a sofilab.py in this repo
+                    if tgt == SCRIPT_PATH or tgt.name == "sofilab.py":
+                        remove_ok = True
+                else:
+                    # Inspect small wrappers for our script path
+                    with pth.open("r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(4096)
+                        if "sofilab.py" in content or str(SCRIPT_PATH) in content:
+                            remove_ok = True
+            except Exception:
+                pass
+
+            if remove_ok:
+                try:
+                    pth.unlink()
+                    removed.append(pth)
+                except PermissionError:
+                    not_removed.append((pth, "permission denied"))
+                except Exception as e:
+                    not_removed.append((pth, f"{e}"))
         except Exception:
             pass
-    if removed_any:
+
+    if removed:
         info("Uninstallation successful!")
+        print("Removed these entries:")
+        for p in removed:
+            print(f"  - {p}")
+        print("If your shell still finds 'sofilab', clear the command cache:")
+        print("  bash/zsh: hash -r   or   re-open the terminal")
+        # If some files could not be removed due to permissions, show guidance
+        if not_removed:
+            print("")
+            print("The following entries could not be removed:")
+            for p, why in not_removed:
+                print(f"  - {p}  ({why})")
+            print("Try removing them with elevated privileges:")
+            print("  sudo rm -f /usr/local/bin/sofilab")
         return 0
     else:
+        # Nothing removed; check if a root-owned /usr/local/bin/sofilab exists
+        ul = Path("/usr/local/bin/sofilab")
+        if ul.exists() or ul.is_symlink():
+            warn("'sofilab' found in /usr/local/bin but cannot remove without sudo")
+            print("Run this to complete uninstall:")
+            print("  sudo rm -f /usr/local/bin/sofilab && hash -r")
+            return 1
         warn("No installation found in standard locations")
         info("Nothing to uninstall")
         return 0
