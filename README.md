@@ -153,6 +153,48 @@ port="SSH_PORT"              # Optional, defaults to 22
 keyfile="ssh/alias_key"      # Optional
 ```
 
+### Scripts & Arguments
+
+You can run local scripts on remote hosts via `run-script` (one script) or `run-scripts` (all scripts listed for a host). Arguments can be configured in `sofilab.conf` so you don’t need to pass them on the CLI each time.
+
+- Inline in `scripts=`: add args after each script name (parsed shell‑style).
+- Per‑script keys: use `script_args.<script>` for long or complex args.
+- Default for all: use `default_script_args` when no per‑script args.
+
+Examples inside a server block:
+
+```properties
+[pmx]
+host="192.168.50.136"
+user="root"
+keyfile="ssh/pmx_key"
+
+# Inline args (easy):
+scripts="testarg1.sh --name alpha, testarg2.sh 'hello world' 42, testarg3.sh --flag A --path '/etc'"
+
+# Or explicit keys (more verbose):
+# scripts="testarg1.sh, testarg2.sh, testarg3.sh"
+# default_script_args="--non-interactive"
+# script_args.testarg1.sh="--name alpha"
+# script_args.testarg2.sh="'hello world' 42"
+# script_args.testarg3.sh="--flag A --path /etc"
+```
+
+Precedence when running scripts:
+
+- CLI args override config (`--script-args ...` or `-- ...`).
+- Then `script_args.<script>`.
+- Then inline args inside `scripts=`.
+- Then `default_script_args`.
+
+Your scripts are searched under `scripts/` and uploaded to the remote user’s home at `~/.sofilab_scripts/` for execution, then removed. SofiLab sets useful environment variables for scripts:
+
+- `SSH_PORT`: configured SSH port for the host
+- `ACTUAL_PORT`: effective port used (after auto‑detection)
+- `ADMIN_USER`: remote username
+- `SSH_KEY_PATH`: path to private key (without `.pub`) if used
+- `SSH_PUBLIC_KEY`: public key contents if available
+
 ### Authentication Priority
 
 1. SSH key (if `keyfile` specified or `ssh/<alias>_key` exists)
@@ -188,6 +230,52 @@ sofilab cp -r ./mydir pmx:~/projects
 # List files on remote host (SFTP)
 sofilab ls-remote pmx ~
 ```
+
+### CLI Quick Reference
+
+- Flexible alias options: you can use positionals or named flags anywhere.
+  - `--host-alias pmx` or `--hostname pmx` work with all host commands.
+
+- Login/status examples:
+  - `sofilab login pmx`
+  - `sofilab login --hostname pmx`
+  - `sofilab status --host-alias pmx`
+
+- Run one script (with args):
+  - Positionals + end‑of‑options: `sofilab run-script pmx my.sh -- a "b c" 2`
+  - Named options: `sofilab run-script --host-alias pmx --script my.sh --script-args a "b c" 2`
+
+- Run all configured scripts (same args applied to each):
+  - `sofilab run-scripts pmx --script-args abc "b c" 123`
+  - `sofilab run-scripts --hostname pmx -- --abc "b c" 123`
+
+- TTY control (place before `--` if you use it):
+  - `--tty` or `--no-tty` with any command that executes scripts.
+
+- Preview what will run (shows args from config):
+  - `sofilab list-scripts pmx`
+
+Tips:
+
+- Use quotes in `sofilab.conf` for arguments with spaces (parsed shell‑style).
+- CLI `--` stops option parsing; anything after goes to the script(s).
+- If a router lacks SFTP (e.g., BusyBox/Dropbear), SofiLab falls back to a shell upload automatically.
+- Logs live under `logs/`. Tail recent output:
+  - `sofilab logs main 100`, `sofilab logs remote 200`, `sofilab clear-logs remote`.
+
+### Typical Workflow
+
+- Add a host to `sofilab.conf` with `scripts=` entries.
+- Place your `.sh` files in `scripts/` and make them executable.
+- Verify: `sofilab list-scripts <alias>` and `sofilab status <alias>`.
+- Run all: `sofilab run-scripts <alias>`.
+- Iterate: adjust per‑script args inline or with `script_args.<script>` keys.
+
+### Troubleshooting
+
+- Host key mismatch: `sofilab reset-hostkey <alias>` then retry.
+- PATH/wrapper issues (Windows): `sofilab doctor --repair-path`.
+- SSH authentication: ensure key path in `keyfile` is correct and readable. If a matching `ssh/<alias>_key` exists, it’s auto‑used.
 
 ## Project Structure
 

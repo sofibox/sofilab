@@ -309,6 +309,9 @@ class ServerConfig:
     port: int = 22
     keyfile: str = ""
     scripts: List[str] = dataclasses.field(default_factory=list)
+    # New: per-script and default arguments
+    script_args_map: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
+    default_script_args: List[str] = dataclasses.field(default_factory=list)
 
 
 def parse_conf(path: Path) -> Tuple[GlobalConfig, Dict[str, ServerConfig]]:
@@ -341,7 +344,46 @@ def parse_conf(path: Path) -> Tuple[GlobalConfig, Dict[str, ServerConfig]]:
         scripts_s = acc.get("scripts", "").strip()
         scripts = [s.strip() for s in scripts_s.split(',') if s.strip()] if scripts_s else []
 
-        sc = ServerConfig(section_aliases, host, user, password, port, keyfile, scripts)
+        # Support inline args inside scripts entries, e.g.:
+        # scripts="foo.sh --x 1, bar.sh 'arg with space'"
+        inline_args_map: Dict[str, List[str]] = {}
+        normalized_scripts: List[str] = []
+        for item in scripts:
+            try:
+                parts = shlex.split(item)
+            except Exception:
+                parts = [p for p in item.split() if p]
+            if not parts:
+                continue
+            name = parts[0]
+            if len(parts) > 1:
+                inline_args_map[name] = parts[1:]
+            normalized_scripts.append(name)
+        scripts = normalized_scripts
+
+        # Parse script args from keys like script_args.<script>="arg1 arg2" and default_script_args
+        script_args_map: Dict[str, List[str]] = {}
+        default_script_args: List[str] = []
+        for k, v in acc.items():
+            if k.startswith("script_args.") or k.startswith("script-args."):
+                name = k.split('.', 1)[1].strip()
+                try:
+                    script_args_map[name] = shlex.split(v)
+                except Exception:
+                    # Fall back to space split
+                    script_args_map[name] = [p for p in v.split() if p]
+            elif k in ("default_script_args", "default-script-args"):
+                try:
+                    default_script_args = shlex.split(v)
+                except Exception:
+                    default_script_args = [p for p in v.split() if p]
+
+        # Merge inline args; explicit keys override inline
+        for _n, _a in inline_args_map.items():
+            if _n not in script_args_map:
+                script_args_map[_n] = _a
+
+        sc = ServerConfig(section_aliases, host, user, password, port, keyfile, scripts, script_args_map, default_script_args)
         for a in section_aliases:
             servers[a] = sc
 
@@ -737,6 +779,70 @@ def server_status(sc: ServerConfig, port_override: Optional[int] = None) -> int:
     return 0
 
 
+## test_speed removed (feature deferred)
+
+def router_webui(sc: ServerConfig, action: str) -> int:
+    """Enable/disable ASUS Merlin web UI (WAN) on router hosts.
+
+    Only runs when the server's alias list includes 'router'.
+    """
+    aliases_lower = {a.lower() for a in sc.aliases}
+    if "router" not in aliases_lower:
+        error("This command is restricted to hosts with alias 'router'")
+        return 1
+
+    use_port = determine_ssh_port(sc.port, sc.host)
+    if not use_port:
+        return 1
+
+    keyfile = get_ssh_keyfile(sc)
+    try:
+        cli = SSHClient(sc.host, use_port, sc.user, sc.password, keyfile)
+        cli.connect(timeout=5)
+    except Exception as e:
+        error(f"SSH connection failed: {e}")
+        return 1
+
+    try:
+        print("")
+        print("🛠️  ASUS Merlin Web UI Control")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"📍 Host: {sc.host}:{use_port}")
+        print(f"🎯 Action: {action}")
+        print("")
+
+        if action == "disable":
+            cmd = (
+                "sh -lc 'set -e; "
+                "nvram set misc_http_x=0; "
+                "nvram commit; "
+                "service restart_firewall; "
+                "service restart_httpd'"
+            )
+        else:  # enable
+            cmd = (
+                "sh -lc 'set -e; "
+                "nvram set misc_http_x=2; "
+                "nvram commit; "
+                "service restart_firewall; "
+                "service restart_httpd'"
+            )
+
+        progress("Applying NVRAM changes on router...")
+        code, out, err = cli.run(cmd, get_pty=False, timeout=60)
+        if out.strip():
+            print(out.strip())
+        if code != 0:
+            error(f"Router command failed (exit {code}): {err.strip() or out.strip()}")
+            return code
+        success("Web UI setting updated and httpd restarted")
+        return 0
+    finally:
+        try:
+            cli.close()
+        except Exception:
+            pass
+
 def ssh_login(sc: ServerConfig) -> int:
     port = determine_ssh_port(sc.port, sc.host)
     if not port:
@@ -829,22 +935,58 @@ def reboot_server(sc: ServerConfig, wait_seconds: Optional[int]) -> int:
 
 
 def upload_script(cli: SSHClient, local_script: Path, remote_rel_dir: str = ".sofilab_scripts") -> str:
-    """Upload a local script to the remote host and return its POSIX path as a string.
+    """Upload a local script to the remote host and return its POSIX path.
 
-    Important: Always return a forward-slash path (POSIX), never a Windows Path,
-    to avoid accidental backslash conversion when running commands remotely.
+    Primary method: SFTP. Fallback: shell stream via 'cat > file' for servers
+    without SFTP (e.g., Dropbear/BusyBox on some routers).
+    Always return a forward-slash (POSIX) path.
     """
-    sftp = cli.sftp()
-    # Ensure remote dir exists
     remote_dir = f"{remote_rel_dir}"
-    try:
-        sftp.stat(remote_dir)
-    except IOError:
-        sftp.mkdir(remote_dir)
     remote_path = f"{remote_dir}/{local_script.name}"
-    sftp.put(str(local_script), remote_path)
-    # Return string path to preserve forward slashes on Windows
-    return remote_path
+
+    # Try SFTP first
+    try:
+        sftp = cli.sftp()
+        try:
+            sftp.stat(remote_dir)
+        except IOError:
+            sftp.mkdir(remote_dir)
+        sftp.put(str(local_script), remote_path)
+        return remote_path
+    except Exception as e:
+        warn(f"SFTP unavailable on server, falling back to shell upload: {e}")
+
+    # Fallback: upload via shell using cat redirect into file in HOME
+    assert cli.client is not None, "SSH not connected"
+    chan = cli.client.get_transport().open_session()
+    # Ensure we are in HOME; make dir; then read stdin to file
+    cmd = (
+        f"sh -lc 'cd ~ && umask 077; mkdir -p {shlex.quote(remote_dir)} && "
+        f"cat > {shlex.quote(remote_path)}'"
+    )
+    chan.exec_command(cmd)
+    try:
+        with local_script.open('rb') as f:
+            while True:
+                chunk = f.read(32768)
+                if not chunk:
+                    break
+                try:
+                    chan.sendall(chunk)
+                except Exception:
+                    break
+        try:
+            chan.shutdown_write()
+        except Exception:
+            pass
+        # Drain any stderr for diagnostics
+        _ = chan.recv_exit_status()
+        return remote_path
+    finally:
+        try:
+            chan.close()
+        except Exception:
+            pass
 
 
 # --------------------------
@@ -1061,7 +1203,7 @@ def detect_remote_shell(cli: SSHClient) -> str:
         return "bash"
 
 
-def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str) -> int:
+def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str, script_args: Optional[List[str]] = None) -> int:
     # Prepare env
     env: Dict[str, str] = {
         "SSH_PORT": str(configured_port),
@@ -1085,7 +1227,15 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, co
     shell = detect_remote_shell(cli)
     shell_opts = " -e" if script_exit_on_error else ""
     # chmod +x and execute; then remove the script file, propagate exit code
-    cmd = f"cd ~ && chmod +x {shlex.quote(remote_path)} && {shell}{shell_opts} {shlex.quote(remote_path)} ; rc=$?; rm -f {shlex.quote(remote_path)}; exit $rc"
+    args_part = ""
+    if script_args:
+        # Safely quote each argument for remote shell
+        args_part = " " + " ".join(shlex.quote(x) for x in script_args)
+    cmd = (
+        f"cd ~ && chmod +x {shlex.quote(remote_path)} && "
+        f"{shell}{shell_opts} {shlex.quote(remote_path)}{args_part} ; "
+        f"rc=$?; rm -f {shlex.quote(remote_path)}; exit $rc"
+    )
 
     # Execute, streaming output and logging lines to remote log
     assert cli.client is not None
@@ -1246,7 +1396,7 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, co
     return rc
 
 
-def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str) -> int:
+def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_args: Optional[List[str]] = None) -> int:
     if not sc.scripts:
         warn(f"No scripts defined for host-alias: {alias}")
         return 0
@@ -1291,6 +1441,12 @@ def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str) -> int:
             print("")
             progress(f"Executing {script_name} on {sc.host}...")
             print("┌─ Remote Script Output ─────────────────────────────────┐")
+            # Determine args for this script: CLI overrides per-script config, else default
+            if script_args is not None and len(script_args) > 0:
+                eff_args = script_args
+            else:
+                eff_args = sc.script_args_map.get(script_name) or sc.default_script_args
+
             rc = execute_remote_script(
                 cli,
                 sc,
@@ -1300,6 +1456,7 @@ def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str) -> int:
                 force_tty=gcfg.force_tty,
                 script_exit_on_error=gcfg.script_exit_on_error,
                 alias=alias,
+                script_args=eff_args,
             )
             print("└─────────────────────────────────────────────────────────┘")
             print("")
@@ -1320,7 +1477,7 @@ def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str) -> int:
     return 0
 
 
-def run_single_script(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_name: str) -> int:
+def run_single_script(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_name: str, script_args: Optional[List[str]] = None) -> int:
     use_port = determine_ssh_port(sc.port, sc.host)
     if not use_port:
         return 1
@@ -1351,6 +1508,12 @@ def run_single_script(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_n
         print("")
         progress(f"Executing script: {script_name} on {sc.host}")
         print("┌─ Remote Script Output ─────────────────────────────────┐")
+        # Determine effective args: CLI overrides per-script config, else default
+        if script_args is not None and len(script_args) > 0:
+            eff_args = script_args
+        else:
+            eff_args = sc.script_args_map.get(script_name) or sc.default_script_args
+
         rc = execute_remote_script(
             cli,
             sc,
@@ -1360,6 +1523,7 @@ def run_single_script(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_n
             force_tty=gcfg.force_tty,
             script_exit_on_error=gcfg.script_exit_on_error,
             alias=alias,
+            script_args=eff_args,
         )
         print("└─────────────────────────────────────────────────────────┘")
         print("")
@@ -1380,7 +1544,15 @@ def list_scripts(sc: ServerConfig, alias: str) -> int:
     if sc.scripts:
         print("Configured scripts (will run in this order):")
         for i, s in enumerate(sc.scripts, start=1):
-            print(f"  {i}. {s}")
+            args_str = None
+            if sc.script_args_map.get(s):
+                args_str = " ".join(shlex.quote(x) for x in sc.script_args_map[s])
+            elif sc.default_script_args:
+                args_str = " ".join(shlex.quote(x) for x in sc.default_script_args)
+            if args_str:
+                print(f"  {i}. {s}    args: {args_str}")
+            else:
+                print(f"  {i}. {s}")
     else:
         print("No scripts configured for this host-alias.")
     print("")
@@ -1648,15 +1820,18 @@ def install_cli() -> int:
             except Exception:
                 pass
 
-            info("✓ Installation successful! Open a new terminal to use 'sofilab'.")
+            info("✓ Installation successful! IMPORTANT: fully close and reopen your terminal to use 'sofilab'.")
             # Print locations we wrote to
             unique_dirs = sorted({p.parent for p in created}, key=lambda p: str(p).lower())
             for d in unique_dirs:
                 print(f"Installed wrappers in: {d}")
-            print("If the command is not found, try in this session:")
-            print("  $env:Path += ';' + \"$env:LOCALAPPDATA\\SofiLab\\bin\"")
-            print("  $env:PATHEXT += ';.CMD;.BAT'")
-            print("Or invoke explicitly once:")
+            print("If the command is not found, do one of the following:")
+            print("- Reopen PowerShell/cmd and run: sofilab --version")
+            print("- OR refresh this PowerShell session (copy-paste):")
+            print("  $env:Path = [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine'); $env:PATHEXT = ([Environment]::GetEnvironmentVariable('PATHEXT','User') + ';' + [Environment]::GetEnvironmentVariable('PATHEXT','Machine')); if (-not $env:PATHEXT.ToUpper().Contains('.CMD')) { $env:PATHEXT += ';.CMD;.BAT' }")
+            print("- OR temporarily add just this folder in this session:")
+            print("  $env:Path += ';' + \"$env:LOCALAPPDATA\\SofiLab\\bin\"; $env:PATHEXT += ';.CMD;.BAT'")
+            print("You can also invoke explicitly once:")
             print("  & \"$env:LOCALAPPDATA\\SofiLab\\bin\\sofilab.cmd\" --version")
             print("PowerShell shim is also available:")
             print("  & \"$env:LOCALAPPDATA\\SofiLab\\bin\\sofilab.ps1\" --version")
@@ -2014,10 +2189,16 @@ def usage_epilog() -> str:
     return f"""
 Examples:
   {SCRIPT_NAME} login pmx
+  {SCRIPT_NAME} login --hostname pmx
   {SCRIPT_NAME} reset-hostkey pmx
   {SCRIPT_NAME} run-scripts pmx --no-tty
+  {SCRIPT_NAME} run-scripts --host-alias pmx --tty
   {SCRIPT_NAME} run-script pmx pmx-update-server.sh --tty
+  {SCRIPT_NAME} run-script pmx error.sh --script-args "abc" "abd" 2 ls
+  {SCRIPT_NAME} run-script pmx error.sh -- abc abd 2 ls
+  {SCRIPT_NAME} run-script --host-alias pmx --script error.sh --tty --script-args abc abd
   {SCRIPT_NAME} status pmx
+  {SCRIPT_NAME} status --hostname pmx
   {SCRIPT_NAME} reboot pmx --wait 180
   {SCRIPT_NAME} list-scripts pmx
   {SCRIPT_NAME} logs remote 100
@@ -2027,6 +2208,8 @@ Examples:
   {SCRIPT_NAME} cp pmx:/var/log/syslog ./logs
   {SCRIPT_NAME} cp -r pmx:/etc/nginx ./backups
   {SCRIPT_NAME} cp ./local.txt pmx:~/uploads
+  {SCRIPT_NAME} router-webui router enable
+  {SCRIPT_NAME} router-webui --host-alias router disable
 """
 
 
@@ -2055,46 +2238,81 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Host based
     p_login = sub.add_parser("login")
-    p_login.add_argument("alias")
+    p_login.add_argument("alias", nargs="?")
+    p_login.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_login.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
     p_reset = sub.add_parser("reset-hostkey")
-    p_reset.add_argument("alias")
+    p_reset.add_argument("alias", nargs="?")
+    p_reset.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_reset.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
     p_status = sub.add_parser("status")
-    p_status.add_argument("alias")
+    p_status.add_argument("alias", nargs="?")
+    p_status.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_status.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_status.add_argument("--port", type=int)
 
     p_reboot = sub.add_parser("reboot")
-    p_reboot.add_argument("alias")
+    p_reboot.add_argument("alias", nargs="?")
+    p_reboot.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_reboot.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_reboot.add_argument("--wait", nargs="?", const=180, type=int)
 
     p_list = sub.add_parser("list-scripts")
-    p_list.add_argument("alias")
+    p_list.add_argument("alias", nargs="?")
+    p_list.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_list.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
     p_runall = sub.add_parser("run-scripts")
-    p_runall.add_argument("alias")
+    p_runall.add_argument("alias", nargs="?")
+    p_runall.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_runall.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_runall.add_argument("--tty", dest="tty", action="store_true")
     p_runall.add_argument("--no-tty", dest="no_tty", action="store_true")
 
     p_runone = sub.add_parser("run-script")
-    p_runone.add_argument("alias")
-    p_runone.add_argument("script")
+    # Positional (backward compatible)
+    p_runone.add_argument("alias", nargs="?")
+    p_runone.add_argument("script", nargs="?")
+    # Optional named variants (order-free)
+    p_runone.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_runone.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
+    p_runone.add_argument("--script", dest="script_opt", help="Script name; alternative to positional")
     p_runone.add_argument("--tty", dest="tty", action="store_true")
     p_runone.add_argument("--no-tty", dest="no_tty", action="store_true")
+    # Script arguments:
+    #  - After a literal "--": captured by REMAINDER below
+    #  - Or via --script-args with one or more values; stops at next option
+    p_runone.add_argument("--script-args", dest="script_args_opt", nargs='+', help="Arguments passed to the script (quote as needed)")
+    p_runone.add_argument("script_args", nargs=argparse.REMAINDER, help="Use after -- to pass raw script arguments")
+
+    # Router utilities (ASUS Merlin)
+    p_rwui = sub.add_parser("router-webui", help="Enable/disable ASUS Merlin remote web UI on router hosts")
+    p_rwui.add_argument("alias", nargs="?")
+    p_rwui.add_argument("action", choices=["enable", "disable"], help="Enable or disable the web UI over WAN")
+    p_rwui.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_rwui.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
     # File transfer
     p_ls = sub.add_parser("ls-remote")
-    p_ls.add_argument("alias")
+    p_ls.add_argument("alias", nargs="?")
+    p_ls.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_ls.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_ls.add_argument("path", nargs="?", default="~")
 
     p_dl = sub.add_parser("download")
-    p_dl.add_argument("alias")
+    p_dl.add_argument("alias", nargs="?")
+    p_dl.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_dl.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_dl.add_argument("remote", nargs="+", help="Remote file/dir path(s)")
     p_dl.add_argument("--dest", "-d", default=".", help="Local destination directory")
     p_dl.add_argument("-r", "--recursive", action="store_true")
 
     p_up = sub.add_parser("upload")
-    p_up.add_argument("alias")
+    p_up.add_argument("alias", nargs="?")
+    p_up.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_up.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_up.add_argument("local", nargs="+", help="Local file/dir path(s)")
     p_up.add_argument("--dest", "-d", default="~", help="Remote destination directory")
     p_up.add_argument("-r", "--recursive", action="store_true")
@@ -2104,6 +2322,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_cp.add_argument("src", nargs="+", help="Source path(s). Use alias:/path for remote")
     p_cp.add_argument("dest", help="Destination. Use alias:/path for remote")
     p_cp.add_argument("-r", "--recursive", action="store_true")
+
+    # (speed test command removed for now)
 
     parser.add_argument("--version", "-V", action="store_true", help="Show version and exit")
 
@@ -2227,6 +2447,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except Exception:
                     pass
 
+    # Normalize flexible inputs for commands supporting alias options before checks
+    if args.cmd in {"login", "reset-hostkey", "status", "reboot", "list-scripts", "run-scripts", "run-script", "ls-remote", "download", "upload", "router-webui"}:
+        if getattr(args, "alias_opt", None):
+            args.alias = args.alias_opt
+        if args.cmd == "run-script" and getattr(args, "script_opt", None):
+            args.script = args.script_opt
+
     # Host-required commands
     if not getattr(args, "alias", None):
         error("Host-alias required for this command")
@@ -2257,9 +2484,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "list-scripts":
         return list_scripts(sc, alias)
     if args.cmd == "run-scripts":
-        return run_scripts(sc, gcfg, alias)
+        # Collect arguments to apply to each script from CLI (overrides config)
+        script_args_cli: Optional[List[str]] = None
+        if getattr(args, "script_args_opt", None):
+            script_args_cli = args.script_args_opt
+        elif getattr(args, "script_args", None):
+            vals = args.script_args
+            if vals and vals[0] == "--":
+                vals = vals[1:]
+            script_args_cli = vals
+        return run_scripts(sc, gcfg, alias, script_args_cli)
     if args.cmd == "run-script":
-        return run_single_script(sc, gcfg, alias, args.script)
+        # Support both patterns: `--script-args ...` (stops at next option) or `--` remainder (must be last)
+        script_args_cli: Optional[List[str]] = None
+        if getattr(args, "script_args_opt", None):
+            script_args_cli = args.script_args_opt
+        elif getattr(args, "script_args", None):
+            vals = args.script_args
+            if vals and vals[0] == "--":
+                vals = vals[1:]
+            script_args_cli = vals
+        return run_single_script(sc, gcfg, alias, args.script, script_args_cli)
     if args.cmd == "ls-remote":
         port = determine_ssh_port(sc.port, sc.host)
         if not port:
@@ -2277,6 +2522,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cli.close()  # type: ignore
             except Exception:
                 pass
+    # (test-speed handler removed for now)
     if args.cmd == "download":
         warn("'download' is deprecated. Use: sofilab cp alias:/path ... <local_dir>")
         port = determine_ssh_port(sc.port, sc.host)
@@ -2315,6 +2561,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cli.close()  # type: ignore
             except Exception:
                 pass
+
+    if args.cmd == "router-webui":
+        # Handled above for alias normalization and validation
+        return router_webui(sc, args.action)
 
     error(f"Unknown command: {args.cmd}")
     parser.print_help()
