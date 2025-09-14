@@ -33,6 +33,7 @@ import importlib
 import subprocess
 import stat
 import posixpath
+import shutil
 
 # Paramiko is loaded lazily. If missing, we will auto-install from requirements.txt.
 PARAMIKO_MOD = None  # type: ignore
@@ -843,7 +844,59 @@ def router_webui(sc: ServerConfig, action: str) -> int:
         except Exception:
             pass
 
-def ssh_login(sc: ServerConfig) -> int:
+def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int) -> Optional[int]:
+    """Try to execute a local hook script for a command.
+
+    Resolution order:
+      1) scripts/<command>.py (cross-platform via current Python)
+      2) Windows: scripts/<command>.ps1 via PowerShell
+      3) POSIX: scripts/<command>.sh via bash/sh
+
+    Returns the exit code if a hook was executed, or None if no hook found.
+    """
+    scripts_dir = SCRIPT_DIR / "scripts"
+    hook_py = scripts_dir / f"{command_name}.py"
+    hook_ps1 = scripts_dir / f"{command_name}.ps1"
+    hook_sh = scripts_dir / f"{command_name}.sh"
+
+    # Build environment for hooks
+    env = os.environ.copy()
+    env.update({
+        "SOFILAB_HOST": sc.host,
+        "SOFILAB_PORT": str(actual_port),
+        "SOFILAB_USER": sc.user,
+        "SOFILAB_PASSWORD": sc.password or "",
+        "SOFILAB_KEYFILE": str(get_ssh_keyfile(sc) or ""),
+        "SOFILAB_ALIAS": alias,
+    })
+
+    try:
+        if hook_py.exists():
+            cmd = [sys.executable, str(hook_py)]
+            return subprocess.call(cmd, env=env)
+        if os.name == 'nt' and hook_ps1.exists():
+            # Prefer pwsh if available, else Windows PowerShell
+            pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(hook_ps1)]
+            return subprocess.call(cmd, env=env)
+        if os.name != 'nt' and hook_sh.exists():
+            bash = shutil.which("bash")
+            if bash:
+                cmd = [bash, str(hook_sh)]
+            else:
+                cmd = ["/bin/sh", str(hook_sh)]
+            return subprocess.call(cmd, env=env)
+    except FileNotFoundError as e:
+        warn(f"Hook interpreter not found: {e}")
+        return 127
+    except Exception as e:
+        error(f"Hook execution error: {e}")
+        return 1
+
+    return None
+
+
+def ssh_login(sc: ServerConfig, alias: str) -> int:
     port = determine_ssh_port(sc.port, sc.host)
     if not port:
         return 1
@@ -864,6 +917,15 @@ def ssh_login(sc: ServerConfig) -> int:
     print(border)
 
     keyfile = get_ssh_keyfile(sc)
+
+    # Optional local hook override (scripts/login.*)
+    hook_rc = _run_local_hook("login", sc, alias, port)
+    if hook_rc is not None:
+        if hook_rc == 0:
+            success("Login hook completed successfully")
+        else:
+            error(f"Login hook failed with exit code {hook_rc}")
+        return hook_rc
 
     info(f"Attempting SSH connection on port {port}...")
     try:
@@ -2474,7 +2536,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             gcfg.force_tty = False
 
     if args.cmd == "login":
-        return ssh_login(sc)
+        return ssh_login(sc, alias)
     if args.cmd == "reset-hostkey":
         return reset_hostkey(sc)
     if args.cmd == "status":
