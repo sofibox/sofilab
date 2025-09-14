@@ -1394,7 +1394,29 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
             pass
         chan = cli.client.get_transport().open_session()
         if force_tty:
-            chan.get_pty()
+            # Negotiate PTY with correct TERM and size, and propagate resizes
+            import shutil
+            term = None
+            # Try to honor explicit TERM from env_kv; fallback to local TERM
+            if env_kv:
+                try:
+                    for item in env_kv:
+                        if not item or "=" not in item:
+                            continue
+                        k, v = item.split("=", 1)
+                        if k == "TERM" and v:
+                            term = v
+                            break
+                except Exception:
+                    pass
+            if not term:
+                term = os.environ.get("TERM") or "xterm-256color"
+            sz = shutil.get_terminal_size(fallback=(80, 24))
+            try:
+                chan.get_pty(term=term, width=sz.columns, height=sz.lines)
+            except TypeError:
+                # Older Paramiko may use (width,height) as (width,height)
+                chan.get_pty(term, sz.columns, sz.lines)
         chan.exec_command(remote_exec)
 
         if force_tty:
@@ -1432,13 +1454,28 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
                         pass
                 return chan.recv_exit_status()
             else:
-                import termios, tty, select as _select
+                import termios, tty, select as _select, signal, shutil
                 fd = sys.stdin.fileno()
                 old_attrs = None
+                old_winch = None
                 try:
                     if sys.stdin.isatty():
                         old_attrs = termios.tcgetattr(fd)
                         tty.setraw(fd)
+                    # Propagate window size changes to remote PTY
+                    try:
+                        def _resize(*_):
+                            try:
+                                sz2 = shutil.get_terminal_size(fallback=(80, 24))
+                                chan.resize_pty(width=sz2.columns, height=sz2.lines)
+                            except Exception:
+                                pass
+                        old_winch = signal.getsignal(signal.SIGWINCH)
+                        signal.signal(signal.SIGWINCH, _resize)
+                        # Send initial size to be safe
+                        _resize()
+                    except Exception:
+                        pass
                     while True:
                         rlist, _, _ = _select.select([chan, sys.stdin], [], [])
                         if chan in rlist:
@@ -1479,6 +1516,12 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
                     try:
                         if old_attrs is not None:
                             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                    except Exception:
+                        pass
+                    try:
+                        if old_winch is not None:
+                            import signal as _sig
+                            _sig.signal(_sig.SIGWINCH, old_winch)
                     except Exception:
                         pass
                     try:
