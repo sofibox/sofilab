@@ -196,7 +196,19 @@ sofilab run-scripts --host-alias pmx --set proxmox --dry-run -- --flag1 A --flag
 sofilab run-scripts --host-alias pmx --set proxmox -- --flag1 A --flag2 "B C"
 ```
 
-SofiLab uploads scripts to `~/.sofilab_scripts/` on the remote and removes them after execution. During execution, SofiLab sets useful environment variables:
+Execution model and interpreters:
+
+- SofiLab uploads scripts to `~/.sofilab_scripts/` on the remote and removes them after execution.
+- Scripts execute on the remote host; your local OS does not affect script execution.
+- By default SofiLab invokes a POSIX shell (sh/bash) to run scripts. Use portable `.sh` for maximum compatibility (BusyBox, Bash, Debian/Alpine, Proxmox).
+- If you want non‑shell steps (Python/Node/etc.), ensure the interpreter exists on the remote and call it from a shell wrapper, for example:
+
+  ```sh
+  #!/usr/bin/env sh
+  exec python3 my_step.py "$@"
+  ```
+
+During execution, SofiLab sets useful environment variables:
 
 - `SSH_PORT`: configured SSH port for the host
 - `ACTUAL_PORT`: effective port used (after auto‑detection)
