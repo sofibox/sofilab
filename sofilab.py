@@ -721,13 +721,15 @@ def get_ssh_keyfile(sc: ServerConfig) -> Optional[Path]:
     return None
 
 
-def server_status(sc: ServerConfig, alias: str, port_override: Optional[int] = None) -> int:
+def server_status(sc: ServerConfig, alias: str, port_override: Optional[int] = None, hook_args: Optional[List[str]] = None) -> int:
     port_to_check = port_override if port_override else determine_ssh_port(sc.port, sc.host)
     if not port_to_check:
         return 1
 
     # Optional local hook override (scripts/hooks/status/* or legacy)
-    hook_rc = _run_local_hook("status", sc, alias, port_to_check)
+    if hook_args and len(hook_args) > 0 and hook_args[0] == "--":
+        hook_args = hook_args[1:]
+    hook_rc = _run_local_hook("status", sc, alias, port_to_check, extra_args=hook_args)
     if hook_rc is not None:
         if hook_rc == 0:
             success("Status hook completed successfully")
@@ -866,11 +868,16 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
     """
     scripts_dir = SCRIPT_DIR / "scripts"
     hooks_dir = scripts_dir / "hooks" / command_name
-    # Preferred new layout
+    hooks_scripts_dir = hooks_dir / "scripts"
+    # Preferred new layout: scripts/hooks/<cmd>/scripts/main.*
+    main_py = hooks_scripts_dir / "main.py"
+    main_ps1 = hooks_scripts_dir / "main.ps1"
+    main_sh = hooks_scripts_dir / "main.sh"
+    # Fallback new layout: scripts/hooks/<cmd>/hook.*
     hook_py_new = hooks_dir / "hook.py"
     hook_ps1_new = hooks_dir / "hook.ps1"
     hook_sh_new = hooks_dir / "hook.sh"
-    # Legacy flat layout
+    # Legacy flat layout: scripts/<cmd>.*
     hook_py_legacy = scripts_dir / f"{command_name}.py"
     hook_ps1_legacy = scripts_dir / f"{command_name}.ps1"
     hook_sh_legacy = scripts_dir / f"{command_name}.sh"
@@ -887,34 +894,61 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
     })
 
     try:
-        # Python hook
+        # 1) Preferred: scripts/hooks/<cmd>/scripts/main.py
+        if main_py.exists():
+            hook_path = str(main_py)
+            info(f"Using {command_name} hook: {hook_path}")
+            cmd = [sys.executable, hook_path] + (extra_args or [])
+            return subprocess.call(cmd, env=env)
+        # 2) Preferred (Windows/POSIX): main.ps1 / main.sh
+        if os.name == 'nt' and main_ps1.exists():
+            pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+            hook_path = str(main_ps1)
+            info(f"Using {command_name} hook: {hook_path}")
+            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", hook_path] + (extra_args or [])
+            return subprocess.call(cmd, env=env)
+        if os.name != 'nt' and main_sh.exists():
+            sh_path = str(main_sh)
+            info(f"Using {command_name} hook: {sh_path}")
+            bash = shutil.which("bash")
+            cmd = [bash, sh_path] + (extra_args or []) if bash else ["/bin/sh", sh_path] + (extra_args or [])
+            return subprocess.call(cmd, env=env)
+        # 3) Fallback new layout: hook.py
         if hook_py_new.exists():
             hook_path = str(hook_py_new)
             info(f"Using {command_name} hook: {hook_path}")
             cmd = [sys.executable, hook_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
+        # 4) Fallback new layout: hook.ps1 / hook.sh
+        if os.name == 'nt' and hook_ps1_new.exists():
+            pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+            ps1_path = str(hook_ps1_new)
+            info(f"Using {command_name} hook: {ps1_path}")
+            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path] + (extra_args or [])
+            return subprocess.call(cmd, env=env)
+        if os.name != 'nt' and hook_sh_new.exists():
+            sh_path = str(hook_sh_new)
+            info(f"Using {command_name} hook: {sh_path}")
+            bash = shutil.which("bash")
+            cmd = [bash, sh_path] + (extra_args or []) if bash else ["/bin/sh", sh_path] + (extra_args or [])
+            return subprocess.call(cmd, env=env)
+        # 5) Legacy flat layout: scripts/<cmd>.py|ps1|sh
         if hook_py_legacy.exists():
             hook_path = str(hook_py_legacy)
             info(f"Using {command_name} hook: {hook_path}")
             cmd = [sys.executable, hook_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
-        # Windows PowerShell hook
-        if os.name == 'nt' and (hook_ps1_new.exists() or hook_ps1_legacy.exists()):
-            # Prefer pwsh if available, else Windows PowerShell
+        if os.name == 'nt' and hook_ps1_legacy.exists():
             pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
-            ps1_path = str(hook_ps1_new if hook_ps1_new.exists() else hook_ps1_legacy)
+            ps1_path = str(hook_ps1_legacy)
             info(f"Using {command_name} hook: {ps1_path}")
             cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
-        # POSIX shell hook
-        if os.name != 'nt' and (hook_sh_new.exists() or hook_sh_legacy.exists()):
-            sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
+        if os.name != 'nt' and hook_sh_legacy.exists():
+            sh_path = str(hook_sh_legacy)
             info(f"Using {command_name} hook: {sh_path}")
             bash = shutil.which("bash")
-            if bash:
-                cmd = [bash, sh_path] + (extra_args or [])
-            else:
-                cmd = ["/bin/sh", sh_path] + (extra_args or [])
+            cmd = [bash, sh_path] + (extra_args or []) if bash else ["/bin/sh", sh_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
     except FileNotFoundError as e:
         warn(f"Hook interpreter not found: {e}")
@@ -931,20 +965,6 @@ def ssh_login(sc: ServerConfig, alias: str) -> int:
     if not port:
         return 1
     resolved_ip = resolve_host_ip(sc.host) or ""
-
-    # Header
-    border = "=" * 70
-    print(border)
-    print(f"SofiLab • Server Management Tool by {AUTHOR}")
-    print(f"Script: {SCRIPT_NAME}  Version: {VERSION} (Build {BUILD_DATE})")
-    print("Action: Login")
-    target = sc.host
-    if resolved_ip and resolved_ip != sc.host:
-        target += f" ({resolved_ip})"
-    target += f" :{port}"
-    print(f"Target: {target}")
-    print(f"Hostname: {socket.gethostname()}  When: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(border)
 
     keyfile = get_ssh_keyfile(sc)
 
@@ -2344,6 +2364,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_status.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
     p_status.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_status.add_argument("--port", type=int)
+    p_status.add_argument("hook_args", nargs=argparse.REMAINDER, help="Use after -- to pass arguments to the status hook")
 
     p_reboot = sub.add_parser("reboot")
     p_reboot.add_argument("alias", nargs="?")
@@ -2432,56 +2453,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         gcfg = GlobalConfig()
         servers = {}
 
-    # Dynamic hook command support: if the first token is not a known command,
-    # attempt to run a hook named after it, passing remaining args through.
-    known_cmds = {
-        "install","uninstall","doctor","logs","clear-logs","login","reset-hostkey",
-        "status","reboot","list-scripts","run-scripts","run-script","ls-remote",
-        "download","upload","cp","router-webui"
-    }
-    if argv and not argv[0].startswith('-') and argv[0] not in known_cmds:
-        hook_cmd = argv[0]
-        rest = argv[1:]
-        # extract alias: --host-alias/--hostname or first non-option
-        alias_dyn: Optional[str] = None
-        i = 0
-        while i < len(rest):
-            tok = rest[i]
-            if tok in ("--host-alias", "--hostname") and i + 1 < len(rest):
-                alias_dyn = rest[i+1]
-                break
-            if not tok.startswith('-') and alias_dyn is None:
-                alias_dyn = tok
-                # do not break; we still pass all args through to hook
-                # but we can stop scanning for alias
-                break
-            i += 1
-        if not alias_dyn:
-            error("Host-alias required for this command")
-            return 1
-        sc_dyn = servers.get(alias_dyn)
-        if not sc_dyn:
-            error(f"Unknown host-alias: {alias_dyn}")
-            return 1
-        port_dyn = determine_ssh_port(sc_dyn.port, sc_dyn.host)
-        if not port_dyn:
-            return 1
-        # Execute hook; if not found, report unknown command
-        rc_dyn = _run_local_hook(hook_cmd, sc_dyn, alias_dyn, port_dyn, extra_args=rest)
-        if rc_dyn is None:
-            error(f"Unknown command: {hook_cmd}")
-            return 1
-        return rc_dyn
-
     # CLI parse
     args = parser.parse_args(argv)
 
     if args.version:
-        print("SofiLab Server Management Tool (Python)")
-        print(f"Version: {VERSION}")
-        print(f"Build: {BUILD_DATE}")
+        border = "=" * 70
+        print(border)
+        print(f"SofiLab • Server Management Tool by {AUTHOR}")
+        print(f"Script: {SCRIPT_NAME}  Version: {VERSION} (Build {BUILD_DATE})")
         print("Features: SSH connections, server monitoring, installation management")
-        print(f"Author: {AUTHOR}")
+        print(border)
         return 0
 
     # Init logging
@@ -2611,7 +2592,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "reset-hostkey":
         return reset_hostkey(sc)
     if args.cmd == "status":
-        return server_status(sc, alias, args.port)
+        extra = getattr(args, "hook_args", None)
+        return server_status(sc, alias, args.port, extra)
     if args.cmd == "reboot":
         return reboot_server(sc, args.wait)
     if args.cmd == "list-scripts":
