@@ -11,6 +11,13 @@ A comprehensive server management tool for SSH connections, server monitoring, i
 - SSH key and password authentication
 - Smart port fallback and connection handling
 
+### ⚡ Remote Exec (New)
+
+- Run ad‑hoc commands on a host via `exec`
+- Pass environments and working directory with `--env KEY=VAL` and `--workdir DIR`
+- Interactive TUIs (htop/btop) with proper PTY sizing and live resize
+- Robust `--` delimiter handling; options can be placed before or after alias
+
 ### 🖥️ Server Monitoring (Coming Soon)
 
 - Real-time server status monitoring
@@ -251,6 +258,29 @@ sofilab cp -r ./mydir pmx:~/projects
 # List files on remote host (SFTP)
 sofilab ls-remote pmx ~
 ```
+
+### Remote Command Exec (New)
+
+Run a one‑off command on a host. Use `--` to separate SofiLab options from the remote command and its args.
+
+```bash
+# Basic
+sofilab exec pmx -- uname -a
+
+# With environment and working directory
+sofilab exec pmx --workdir /var/log -- tail -n 50 syslog
+sofilab exec pmx --env TERM=xterm-256color -- htop
+
+# TTY control for TUIs
+sofilab exec --host-alias pmx --tty -- btop
+sofilab exec pmx --no-tty -- ls -la /etc
+```
+
+Notes:
+
+- You may place `--env`, `--workdir`, `--tty`, `--no-tty` either before or after the `--` delimiter; SofiLab salvages them reliably. For clarity, placing them before `--` is recommended.
+- In TTY mode, SofiLab allocates the remote PTY with your local terminal size and TERM, and propagates SIGWINCH on resize. Full‑screen apps (btop/htop) now use the full window and resize live.
+- The remote shell is detected (bash if available, otherwise sh) and used as `shell -c '<command>'` for consistent behavior.
 
 ### CLI Quick Reference
 
