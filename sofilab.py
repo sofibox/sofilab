@@ -855,7 +855,23 @@ def router_webui(sc: ServerConfig, action: str) -> int:
         except Exception:
             pass
 
-def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int, extra_args: Optional[List[str]] = None) -> Optional[int]:
+def _get_ssh_keyfile_quiet(sc: ServerConfig) -> Optional[Path]:
+    # Resolve explicit keyfile without logging
+    if sc.keyfile:
+        p = Path(sc.keyfile)
+        if not p.is_absolute():
+            p = SCRIPT_DIR / p
+        if p.exists():
+            return p
+    # Auto-detect ssh/<alias>_key without logging
+    for a in sc.aliases:
+        p = SCRIPT_DIR / "ssh" / f"{a}_key"
+        if p.exists():
+            return p
+    return None
+
+
+def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int, extra_args: Optional[List[str]] = None, key_path: Optional[Path] = None) -> Optional[int]:
     """Try to execute a local hook script for a command.
 
     Resolution order (new preferred layout first, with legacy fallback):
@@ -889,7 +905,7 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
         "SOFILAB_PORT": str(actual_port),
         "SOFILAB_USER": sc.user,
         "SOFILAB_PASSWORD": sc.password or "",
-        "SOFILAB_KEYFILE": str(get_ssh_keyfile(sc) or ""),
+        "SOFILAB_KEYFILE": str((key_path or _get_ssh_keyfile_quiet(sc) or Path()).__str__() if (key_path or _get_ssh_keyfile_quiet(sc)) else ""),
         "SOFILAB_ALIAS": alias,
     })
 
@@ -969,7 +985,7 @@ def ssh_login(sc: ServerConfig, alias: str) -> int:
     keyfile = get_ssh_keyfile(sc)
 
     # Optional local hook override (scripts/login.*)
-    hook_rc = _run_local_hook("login", sc, alias, port)
+    hook_rc = _run_local_hook("login", sc, alias, port, key_path=keyfile)
     if hook_rc is not None:
         if hook_rc == 0:
             success("Login hook completed successfully")
@@ -1003,7 +1019,7 @@ def reboot_server(sc: ServerConfig, wait_seconds: Optional[int], alias: str, hoo
     # Optional local hook override (scripts/hooks/reboot/scripts/main.* or legacy)
     if hook_args and len(hook_args) > 0 and hook_args[0] == "--":
         hook_args = hook_args[1:]
-    hook_rc = _run_local_hook("reboot", sc, alias, port, extra_args=hook_args)
+    hook_rc = _run_local_hook("reboot", sc, alias, port, extra_args=hook_args, key_path=_get_ssh_keyfile_quiet(sc))
     if hook_rc is not None:
         if hook_rc == 0:
             success("Reboot hook completed successfully")
@@ -2521,6 +2537,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_list.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
     p_runall = sub.add_parser("run-scripts", help="Run an ordered set of scripts from scripts/sets/<name> by numeric prefix")
+    p_runall.add_argument("alias", nargs="?", help="Target host alias (positional, or use --host-alias)")
     p_runall.add_argument("--set", dest="set", required=True, help="Script set name under scripts/sets/<name>")
     p_runall.add_argument("--host-alias", dest="alias_opt", help="Target host alias")
     p_runall.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
