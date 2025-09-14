@@ -721,10 +721,19 @@ def get_ssh_keyfile(sc: ServerConfig) -> Optional[Path]:
     return None
 
 
-def server_status(sc: ServerConfig, port_override: Optional[int] = None) -> int:
+def server_status(sc: ServerConfig, alias: str, port_override: Optional[int] = None) -> int:
     port_to_check = port_override if port_override else determine_ssh_port(sc.port, sc.host)
     if not port_to_check:
         return 1
+
+    # Optional local hook override (scripts/hooks/status/* or legacy)
+    hook_rc = _run_local_hook("status", sc, alias, port_to_check)
+    if hook_rc is not None:
+        if hook_rc == 0:
+            success("Status hook completed successfully")
+        else:
+            error(f"Status hook failed with exit code {hook_rc}")
+        return hook_rc
 
     print("")
     print("🩺 Server Status")
@@ -2561,7 +2570,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "reset-hostkey":
         return reset_hostkey(sc)
     if args.cmd == "status":
-        return server_status(sc, args.port)
+        return server_status(sc, alias, args.port)
     if args.cmd == "reboot":
         return reboot_server(sc, args.wait)
     if args.cmd == "list-scripts":
