@@ -4,26 +4,42 @@ set -eu
 AIDE_BIN=$(command -v aide || true)
 AIDE_INIT_BIN=$(command -v aideinit || true)
 CONF="/etc/aide/aide.conf"
+DB_DIR="/var/lib/aide"
+DB_NEW="$DB_DIR/aide.db.new"
+DB="$DB_DIR/aide.db"
 
-if [ -n "$AIDE_INIT_BIN" ]; then
-  echo "Initializing AIDE database via aideinit ..."
-  "$AIDE_INIT_BIN" -y -c "$CONF" || exit 1
-else
-  if [ -z "$AIDE_BIN" ]; then
-    echo "ERROR: aide not found" >&2
-    exit 1
-  fi
-  echo "Initializing AIDE database via 'aide --init' ..."
-  "$AIDE_BIN" --init -c "$CONF" || exit 1
+if [ -z "$AIDE_BIN" ] && [ -z "$AIDE_INIT_BIN" ]; then
+  echo "ERROR: aide not found; ensure prerequisites step installed it" >&2
+  exit 1
 fi
 
-DB_NEW="/var/lib/aide/aide.db.new"
-DB="/var/lib/aide/aide.db"
+# Ensure runtime dirs exist with sane perms (some distros require this)
+mkdir -p /run/aide || true
+chmod 700 /run/aide 2>/dev/null || true
+chown root:root /run/aide 2>/dev/null || true
+mkdir -p "$DB_DIR" || true
+chown root:root "$DB_DIR" 2>/dev/null || true
+
+# Idempotent: if DB already exists, skip init
+if [ -f "$DB" ]; then
+  echo "OK: AIDE database already present at $DB; skipping initialization"
+  exit 0
+fi
+
+echo "Initializing AIDE database ..."
+rc=0
+if [ -n "$AIDE_INIT_BIN" ]; then
+  "$AIDE_INIT_BIN" -y -c "$CONF" || rc=$?
+else
+  "$AIDE_BIN" --init -c "$CONF" || rc=$?
+fi
+
+# Some AIDE versions return non-zero even when DB is produced; trust DB presence
 if [ -f "$DB_NEW" ]; then
   mv -f "$DB_NEW" "$DB"
-  echo "OK: Initialized database copied to $DB"
-else
-  echo "WARN: Expected $DB_NEW not found; check AIDE output" >&2
+  echo "OK: Initialized database copied to $DB (init rc=$rc)"
+  exit 0
 fi
 
-exit 0
+echo "ERROR: Initialization failed (rc=$rc) and no $DB_NEW produced" >&2
+exit 1
