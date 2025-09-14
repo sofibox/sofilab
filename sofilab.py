@@ -309,8 +309,8 @@ class ServerConfig:
     password: str = ""
     port: int = 22
     keyfile: str = ""
+    # Legacy fields no longer used for run-scripts; preserved for compatibility
     scripts: List[str] = dataclasses.field(default_factory=list)
-    # New: per-script and default arguments
     script_args_map: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
     default_script_args: List[str] = dataclasses.field(default_factory=list)
 
@@ -1315,7 +1315,7 @@ def detect_remote_shell(cli: SSHClient) -> str:
         return "bash"
 
 
-def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str, script_args: Optional[List[str]] = None) -> int:
+def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, configured_port: int, actual_port: int, force_tty: bool, script_exit_on_error: bool, alias: str, script_args: Optional[List[str]] = None, additional_env: Optional[Dict[str, str]] = None) -> int:
     # Prepare env
     env: Dict[str, str] = {
         "SSH_PORT": str(configured_port),
@@ -1335,6 +1335,18 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, co
                 info("Including SSH public key for automatic setup")
             except Exception:
                 pass
+
+    # Add SofiLab envs and any provided additional env
+    env.update({
+        "SOFILAB_ALIAS": alias,
+        "SOFILAB_HOST": sc.host,
+        "SOFILAB_PORT": str(actual_port),
+        "SOFILAB_USER": sc.user,
+        "SOFILAB_KEYFILE": env.get("SSH_KEY_PATH", ""),
+        "SOFILAB_PASSWORD": sc.password or "",
+    })
+    if additional_env:
+        env.update({k: str(v) for k, v in additional_env.items()})
 
     shell = detect_remote_shell(cli)
     shell_opts = " -e" if script_exit_on_error else ""
@@ -1508,56 +1520,138 @@ def execute_remote_script(cli: SSHClient, sc: ServerConfig, remote_path: str, co
     return rc
 
 
-def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_args: Optional[List[str]] = None) -> int:
-    if not sc.scripts:
-        warn(f"No scripts defined for host-alias: {alias}")
+def _resolve_script_set_dir(set_name: str) -> Optional[Path]:
+    # Only allow sets located under scripts/sets/<set_name>
+    p = SCRIPT_DIR / "scripts" / "sets" / set_name
+    if p.exists() and p.is_dir():
+        return p
+    return None
+
+
+def _discover_priority_scripts(root: Path) -> List[Path]:
+    numbered: List[Tuple[int, Path]] = []
+    unnumbered: List[Path] = []
+    for p in sorted(root.glob("*.sh")):
+        name = p.name
+        m = re.match(r"^(\d{2,})_.*\.sh$", name)
+        if m:
+            try:
+                prefix = int(m.group(1))
+            except Exception:
+                prefix = 0
+            numbered.append((prefix, p))
+        else:
+            unnumbered.append(p)
+    numbered.sort(key=lambda t: (t[0], t[1].name))
+    unnumbered.sort(key=lambda p: p.name)
+    return [p for _, p in numbered] + unnumbered
+
+
+def _read_env_file(root: Path) -> Dict[str, str]:
+    envf = root / "_env"
+    out: Dict[str, str] = {}
+    if not envf.exists():
+        return out
+    try:
+        for line in envf.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            if "=" in s:
+                k, v = s.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def _read_args_file(root: Path, script_path: Path) -> List[str]:
+    args_dir = root / "_args"
+    if not args_dir.exists():
+        return []
+    base = script_path.stem  # without .sh
+    af = args_dir / f"{base}.args"
+    if not af.exists():
+        return []
+    try:
+        return shlex.split(af.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return [x for x in af.read_text(encoding="utf-8", errors="ignore").split() if x]
+
+
+def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str, set_name: str, common_args: Optional[List[str]] = None, dry_run: bool = False) -> int:
+    set_dir = _resolve_script_set_dir(set_name)
+    if not set_dir:
+        error(f"Script set not found: {set_name}")
+        print(f"Expected at: {SCRIPT_DIR/'scripts'/'sets'/set_name}")
+        return 1
+
+    scripts = _discover_priority_scripts(set_dir)
+    if not scripts:
+        warn(f"No priority scripts found in set: {set_dir}")
         return 0
 
-    print("")
-    print("🚀 Starting script execution on server")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"📍 Server: {sc.host}:{sc.port}")
-    print(f"👤 User: {sc.user}")
-    print(f"📜 Scripts: {', '.join(sc.scripts)}")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("")
+    common = []
+    if common_args:
+        common = common_args[1:] if (len(common_args) > 0 and common_args[0] == "--") else common_args
 
-    total = len(sc.scripts)
-    for idx, script_name in enumerate(sc.scripts, start=1):
-        script_name = script_name.strip()
+    # Dry-run planning output
+    if dry_run:
         print("")
-        print(f"📋 [{idx}/{total}] Processing: {script_name}")
+        print("📝 Planned execution (dry-run)")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"Set: {set_dir}")
+        print(f"Server: {sc.host}:{sc.port}  User: {sc.user}")
+        envk = _read_env_file(set_dir)
+        if envk:
+            print(f"Env file: {set_dir/'_env'}  ({len(envk)} vars)")
+        if common:
+            print(f"Common args: {' '.join(shlex.quote(x) for x in common)}")
+        for idx, sp in enumerate(scripts, start=1):
+            per = _read_args_file(set_dir, sp)
+            extra = f" + {' '.join(shlex.quote(x) for x in per)}" if per else ""
+            is_numbered = bool(re.match(r"^\d{2,}_", sp.name))
+            tag = "" if is_numbered else " (unnumbered)"
+            print(f"  [{idx}/{len(scripts)}] {sp.name}{tag}{extra}")
+        return 0
 
-        use_port = determine_ssh_port(sc.port, sc.host)
-        if not use_port:
-            return 1
+    use_port = determine_ssh_port(sc.port, sc.host)
+    if not use_port:
+        return 1
 
-        local_script = SCRIPT_DIR / "scripts" / script_name
-        if not local_script.exists():
-            error(f"Script not found: {local_script}")
-            return 1
+    try:
+        cli = SSHClient(sc.host, use_port, sc.user, sc.password, get_ssh_keyfile(sc))
+        cli.connect(timeout=5)
+    except Exception as e:
+        error(f"SSH connection failed: {e}")
+        return 1
 
-        try:
-            cli = SSHClient(sc.host, use_port, sc.user, sc.password, get_ssh_keyfile(sc))
-            cli.connect(timeout=5)
-        except Exception as e:
-            error(f"SSH connection failed: {e}")
-            return 1
+    try:
+        set_env = _read_env_file(set_dir)
+        total = len(scripts)
+        for idx, sp in enumerate(scripts, start=1):
+            print("")
+            print(f"📋 [{idx}/{total}] Processing: {sp.name}")
+            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        try:
-            progress(f"Uploading {script_name} to server...")
-            remote_path = upload_script(cli, local_script)
+            per_args = _read_args_file(set_dir, sp)
+            eff_args = (common or []) + per_args
+
+            progress(f"Uploading {sp.name} to server...")
+            remote_path = upload_script(cli, sp)
             success("Script uploaded successfully")
 
             print("")
-            progress(f"Executing {script_name} on {sc.host}...")
+            progress(f"Executing {sp.name} on {sc.host}...")
             print("┌─ Remote Script Output ─────────────────────────────────┐")
-            # Determine args for this script: CLI overrides per-script config, else default
-            if script_args is not None and len(script_args) > 0:
-                eff_args = script_args
-            else:
-                eff_args = sc.script_args_map.get(script_name) or sc.default_script_args
+
+            additional_env = dict(set_env)
+            additional_env.update({
+                "SOFILAB_STEP_INDEX": str(idx),
+                "SOFILAB_STEP_TOTAL": str(total),
+                "SOFILAB_SCRIPT_NAME": sp.name,
+                "SOFILAB_SET_NAME": set_name,
+            })
 
             rc = execute_remote_script(
                 cli,
@@ -1569,23 +1663,27 @@ def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_args: O
                 script_exit_on_error=gcfg.script_exit_on_error,
                 alias=alias,
                 script_args=eff_args,
+                additional_env=additional_env,
             )
             print("└─────────────────────────────────────────────────────────┘")
             print("")
             if rc != 0:
-                error(f"Script execution failed: {script_name}")
+                error(f"Script execution failed: {sp.name}")
                 return rc
-            success(f"Script executed successfully: {script_name}")
+            success(f"Script executed successfully: {sp.name}")
             if idx < total:
                 info("Waiting 3 seconds before next script to avoid rate limiting...")
                 time.sleep(3)
-        finally:
+    finally:
+        try:
             cli.close()
+        except Exception:
+            pass
 
     print("")
     print("🏁 All scripts completed successfully!")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    success(f"Script execution completed for {alias}")
+    success(f"Script execution completed for set '{set_name}' on {alias}")
     return 0
 
 
@@ -1594,14 +1692,38 @@ def run_single_script(sc: ServerConfig, gcfg: GlobalConfig, alias: str, script_n
     if not use_port:
         return 1
 
-    local_script = SCRIPT_DIR / "scripts" / script_name
+    # Resolve script path with default root at scripts/main.
+    def _resolve_local_script(name: str) -> Path:
+        p = Path(name)
+        if p.is_absolute():
+            return p
+        # Allow users to pass "scripts/..." or "main/..."
+        if name.startswith("scripts/"):
+            return SCRIPT_DIR / name
+        rel = name
+        if rel.startswith("main/"):
+            rel = rel[len("main/"):]
+        return (SCRIPT_DIR / "scripts" / "main" / rel)
+
+    local_script = _resolve_local_script(script_name)
     if not local_script.exists():
         error(f"Script not found: {local_script}")
         print("")
-        print(f"Available scripts in {SCRIPT_DIR/'scripts'}:")
+        base = SCRIPT_DIR / 'scripts' / 'main'
+        print(f"Available scripts (recursive) under {base}:")
         try:
-            for p in sorted((SCRIPT_DIR / 'scripts').glob("*.sh")):
-                print(f"  - {p.name}")
+            if base.exists():
+                any_found = False
+                for p in sorted(base.rglob("*.sh")):
+                    any_found = True
+                    try:
+                        print(f"  - {p.relative_to(base)}")
+                    except Exception:
+                        print(f"  - {p}")
+                if not any_found:
+                    print("  (no scripts found)")
+            else:
+                print("  (scripts/main directory not found)")
         except Exception:
             pass
         return 1
@@ -1653,35 +1775,43 @@ def list_scripts(sc: ServerConfig, alias: str) -> int:
     print(f"Server: {sc.host}")
     print(f"Host-alias: {alias}")
     print("")
-    if sc.scripts:
-        print("Configured scripts (will run in this order):")
-        for i, s in enumerate(sc.scripts, start=1):
-            args_str = None
-            if sc.script_args_map.get(s):
-                args_str = " ".join(shlex.quote(x) for x in sc.script_args_map[s])
-            elif sc.default_script_args:
-                args_str = " ".join(shlex.quote(x) for x in sc.default_script_args)
-            if args_str:
-                print(f"  {i}. {s}    args: {args_str}")
-            else:
-                print(f"  {i}. {s}")
-    else:
-        print("No scripts configured for this host-alias.")
-    print("")
-    print(f"All available scripts in {SCRIPT_DIR/'scripts'}:")
-    if (SCRIPT_DIR / "scripts").exists():
-        any_found = False
-        for p in sorted((SCRIPT_DIR / "scripts").glob("*.sh")):
-            any_found = True
-            print(f"  - {p.name}")
-        if not any_found:
+    # Show single scripts from scripts/main recursively
+    main_root = SCRIPT_DIR / "scripts" / "main"
+    print(f"Single scripts under {main_root}:")
+    if main_root.exists():
+        found_main: List[Path] = []
+        try:
+            found_main = sorted(main_root.rglob("*.sh"))
+        except Exception:
+            pass
+        if found_main:
+            for p in found_main:
+                try:
+                    print(f"  - {p.relative_to(main_root)}")
+                except Exception:
+                    print(f"  - {p}")
+        else:
             print("  (no scripts found)")
     else:
-        print("  (scripts directory not found)")
+        print("  (scripts/main directory not found)")
+
+    # Show available sets under scripts/sets
+    sets_root = SCRIPT_DIR / "scripts" / "sets"
     print("")
-    print(f"To run all configured scripts in order:\n  {SCRIPT_NAME} run-scripts {alias}")
+    print(f"Script sets available under {sets_root}:")
+    if sets_root.exists():
+        sets = [p for p in sorted(sets_root.iterdir()) if p.is_dir()]
+        if sets:
+            for d in sets:
+                print(f"  - {d.name}")
+        else:
+            print("  (no sets found)")
+    else:
+        print("  (scripts/sets directory not found)")
     print("")
-    print(f"To run a specific script:\n  {SCRIPT_NAME} run-script {alias} <script-name>")
+    print(f"To run a set (priority-based):\n  {SCRIPT_NAME} run-scripts --host-alias {alias} --set <set-name>")
+    print("")
+    print(f"To run a specific script:\n  {SCRIPT_NAME} run-script --host-alias {alias} <relative-path-under-scripts/main>")
     return 0
 
 
@@ -2304,8 +2434,8 @@ Examples:
   {SCRIPT_NAME} login --hostname pmx
   {SCRIPT_NAME} reset-hostkey pmx
   {SCRIPT_NAME} run-scripts pmx --no-tty
-  {SCRIPT_NAME} run-scripts --host-alias pmx --tty
-  {SCRIPT_NAME} run-script pmx pmx-update-server.sh --tty
+  {SCRIPT_NAME} run-scripts --host-alias pmx --set myset --tty
+  {SCRIPT_NAME} run-scripts --host-alias pmx --set myset -- --flag value
   {SCRIPT_NAME} run-script pmx error.sh --script-args "abc" "abd" 2 ls
   {SCRIPT_NAME} run-script pmx error.sh -- abc abd 2 ls
   {SCRIPT_NAME} run-script --host-alias pmx --script error.sh --tty --script-args abc abd
@@ -2377,12 +2507,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_list.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
     p_list.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
 
-    p_runall = sub.add_parser("run-scripts")
-    p_runall.add_argument("alias", nargs="?")
-    p_runall.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_runall = sub.add_parser("run-scripts", help="Run an ordered set of scripts from scripts/sets/<name> by numeric prefix")
+    p_runall.add_argument("--set", dest="set", required=True, help="Script set name under scripts/sets/<name>")
+    p_runall.add_argument("--host-alias", dest="alias_opt", help="Target host alias")
     p_runall.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_runall.add_argument("--tty", dest="tty", action="store_true")
     p_runall.add_argument("--no-tty", dest="no_tty", action="store_true")
+    p_runall.add_argument("--dry-run", action="store_true", help="List planned execution without running")
+    p_runall.add_argument("script_args", nargs=argparse.REMAINDER, help="Use after -- to pass common args to each script")
 
     p_runone = sub.add_parser("run-script")
     # Positional (backward compatible)
@@ -2563,18 +2695,35 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Normalize flexible inputs for commands supporting alias options before checks
     if args.cmd in {"login", "reset-hostkey", "status", "reboot", "list-scripts", "run-scripts", "run-script", "ls-remote", "download", "upload", "router-webui"}:
+        prev_alias = getattr(args, "alias", None)
         if getattr(args, "alias_opt", None):
             args.alias = args.alias_opt
-        if args.cmd == "run-script" and getattr(args, "script_opt", None):
-            args.script = args.script_opt
+        if args.cmd == "run-script":
+            if getattr(args, "script_opt", None):
+                args.script = args.script_opt
+            # If alias came from --host-alias/--hostname and the positional 'alias'
+            # was actually the script path, recover it.
+            if getattr(args, "alias_opt", None) and prev_alias:
+                needs_fix = (args.script is None) or (
+                    isinstance(args.script, str) and args.script.startswith('-')
+                )
+                if needs_fix and not prev_alias.startswith('-'):
+                    # Treat previous positional alias token as script path
+                    args.script = prev_alias
 
     # Host-required commands
-    if not getattr(args, "alias", None):
-        error("Host-alias required for this command")
-        parser.print_help()
-        return 1
-
-    alias = args.alias
+    if args.cmd == "run-scripts":
+        alias_norm = getattr(args, "alias", None) or getattr(args, "alias_opt", None)
+        if not alias_norm:
+            error("Host-alias required for run-scripts (use --host-alias or --hostname)")
+            return 1
+        alias = alias_norm
+    else:
+        if not getattr(args, "alias", None):
+            error("Host-alias required for this command")
+            parser.print_help()
+            return 1
+        alias = args.alias
     sc = servers.get(alias)
     if not sc:
         error(f"Unknown host-alias: {alias}")
@@ -2599,16 +2748,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "list-scripts":
         return list_scripts(sc, alias)
     if args.cmd == "run-scripts":
-        # Collect arguments to apply to each script from CLI (overrides config)
-        script_args_cli: Optional[List[str]] = None
-        if getattr(args, "script_args_opt", None):
-            script_args_cli = args.script_args_opt
-        elif getattr(args, "script_args", None):
-            vals = args.script_args
-            if vals and vals[0] == "--":
-                vals = vals[1:]
-            script_args_cli = vals
-        return run_scripts(sc, gcfg, alias, script_args_cli)
+        set_name = getattr(args, "set", None)
+        if not set_name:
+            error("Script set name is required: run-scripts <set> --host-alias <alias>")
+            return 1
+        common_args = getattr(args, "script_args", None)
+        return run_scripts(sc, gcfg, alias, set_name, common_args, getattr(args, "dry_run", False))
     if args.cmd == "run-script":
         # Support both patterns: `--script-args ...` (stops at next option) or `--` remainder (must be last)
         script_args_cli: Optional[List[str]] = None
