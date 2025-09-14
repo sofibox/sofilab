@@ -853,7 +853,7 @@ def router_webui(sc: ServerConfig, action: str) -> int:
         except Exception:
             pass
 
-def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int) -> Optional[int]:
+def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int, extra_args: Optional[List[str]] = None) -> Optional[int]:
     """Try to execute a local hook script for a command.
 
     Resolution order (new preferred layout first, with legacy fallback):
@@ -891,12 +891,12 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
         if hook_py_new.exists():
             hook_path = str(hook_py_new)
             info(f"Using {command_name} hook: {hook_path}")
-            cmd = [sys.executable, hook_path]
+            cmd = [sys.executable, hook_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
         if hook_py_legacy.exists():
             hook_path = str(hook_py_legacy)
             info(f"Using {command_name} hook: {hook_path}")
-            cmd = [sys.executable, hook_path]
+            cmd = [sys.executable, hook_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
         # Windows PowerShell hook
         if os.name == 'nt' and (hook_ps1_new.exists() or hook_ps1_legacy.exists()):
@@ -904,7 +904,7 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
             pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
             ps1_path = str(hook_ps1_new if hook_ps1_new.exists() else hook_ps1_legacy)
             info(f"Using {command_name} hook: {ps1_path}")
-            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
+            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
         # POSIX shell hook
         if os.name != 'nt' and (hook_sh_new.exists() or hook_sh_legacy.exists()):
@@ -912,9 +912,9 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
             info(f"Using {command_name} hook: {sh_path}")
             bash = shutil.which("bash")
             if bash:
-                cmd = [bash, sh_path]
+                cmd = [bash, sh_path] + (extra_args or [])
             else:
-                cmd = ["/bin/sh", sh_path]
+                cmd = ["/bin/sh", sh_path] + (extra_args or [])
             return subprocess.call(cmd, env=env)
     except FileNotFoundError as e:
         warn(f"Hook interpreter not found: {e}")
@@ -2431,6 +2431,47 @@ def main(argv: Optional[List[str]] = None) -> int:
         # init logging with defaults so users still see logs if desired
         gcfg = GlobalConfig()
         servers = {}
+
+    # Dynamic hook command support: if the first token is not a known command,
+    # attempt to run a hook named after it, passing remaining args through.
+    known_cmds = {
+        "install","uninstall","doctor","logs","clear-logs","login","reset-hostkey",
+        "status","reboot","list-scripts","run-scripts","run-script","ls-remote",
+        "download","upload","cp","router-webui"
+    }
+    if argv and not argv[0].startswith('-') and argv[0] not in known_cmds:
+        hook_cmd = argv[0]
+        rest = argv[1:]
+        # extract alias: --host-alias/--hostname or first non-option
+        alias_dyn: Optional[str] = None
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok in ("--host-alias", "--hostname") and i + 1 < len(rest):
+                alias_dyn = rest[i+1]
+                break
+            if not tok.startswith('-') and alias_dyn is None:
+                alias_dyn = tok
+                # do not break; we still pass all args through to hook
+                # but we can stop scanning for alias
+                break
+            i += 1
+        if not alias_dyn:
+            error("Host-alias required for this command")
+            return 1
+        sc_dyn = servers.get(alias_dyn)
+        if not sc_dyn:
+            error(f"Unknown host-alias: {alias_dyn}")
+            return 1
+        port_dyn = determine_ssh_port(sc_dyn.port, sc_dyn.host)
+        if not port_dyn:
+            return 1
+        # Execute hook; if not found, report unknown command
+        rc_dyn = _run_local_hook(hook_cmd, sc_dyn, alias_dyn, port_dyn, extra_args=rest)
+        if rc_dyn is None:
+            error(f"Unknown command: {hook_cmd}")
+            return 1
+        return rc_dyn
 
     # CLI parse
     args = parser.parse_args(argv)
