@@ -880,26 +880,31 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
     try:
         # Python hook
         if hook_py_new.exists():
-            cmd = [sys.executable, str(hook_py_new)]
+            hook_path = str(hook_py_new)
+            info(f"Using {command_name} hook: {hook_path}")
+            cmd = [sys.executable, hook_path]
             return subprocess.call(cmd, env=env)
         if hook_py_legacy.exists():
-            cmd = [sys.executable, str(hook_py_legacy)]
+            hook_path = str(hook_py_legacy)
+            info(f"Using {command_name} hook: {hook_path}")
+            cmd = [sys.executable, hook_path]
             return subprocess.call(cmd, env=env)
         # Windows PowerShell hook
         if os.name == 'nt' and (hook_ps1_new.exists() or hook_ps1_legacy.exists()):
             # Prefer pwsh if available, else Windows PowerShell
             pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
             ps1_path = str(hook_ps1_new if hook_ps1_new.exists() else hook_ps1_legacy)
+            info(f"Using {command_name} hook: {ps1_path}")
             cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
             return subprocess.call(cmd, env=env)
         # POSIX shell hook
         if os.name != 'nt' and (hook_sh_new.exists() or hook_sh_legacy.exists()):
+            sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
+            info(f"Using {command_name} hook: {sh_path}")
             bash = shutil.which("bash")
             if bash:
-                sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
                 cmd = [bash, sh_path]
             else:
-                sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
                 cmd = ["/bin/sh", sh_path]
             return subprocess.call(cmd, env=env)
     except FileNotFoundError as e:
