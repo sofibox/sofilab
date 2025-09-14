@@ -1332,6 +1332,156 @@ def upload_items(cli: SSHClient, local_paths: List[Path], remote_dest: str, recu
     return any_error
 
 
+def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], force_tty: bool) -> int:
+    """Run a one-off remote command. If force_tty is True, allocate a PTY and
+    bridge I/O for interactive TUIs (htop/btop). Otherwise, stream stdout/stderr
+    and return the exit code.
+    """
+    port = determine_ssh_port(sc.port, sc.host)
+    if not port:
+        return 1
+
+    if not cmd_argv:
+        error("No remote command provided. Use: sofilab exec <alias> -- <cmd> [args]")
+        return 1
+
+    # Build a shell-safe command string executed by /bin/sh -lc
+    shcmd = " ".join(shlex.quote(x) for x in cmd_argv)
+    remote_exec = f"sh -lc {shlex.quote(shcmd)}"
+
+    try:
+        cli = SSHClient(sc.host, port, sc.user, sc.password, get_ssh_keyfile(sc))
+        cli.connect(timeout=5)
+    except Exception as e:
+        error(f"SSH connection failed: {e}")
+        return 1
+
+    try:
+        assert cli.client is not None
+        chan = cli.client.get_transport().open_session()
+        if force_tty:
+            chan.get_pty()
+        chan.exec_command(remote_exec)
+
+        if force_tty:
+            # Interactive bridging similar to script execution
+            if os.name == 'nt':
+                import threading, msvcrt
+                stop = False
+                def reader():
+                    while not stop:
+                        data = chan.recv(32768)
+                        if not data:
+                            break
+                        sys.stdout.write(data.decode(errors="ignore"))
+                        sys.stdout.flush()
+                t = threading.Thread(target=reader, daemon=True)
+                t.start()
+                try:
+                    while True:
+                        if msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            if ch == '\r':
+                                chan.send("\r")
+                            else:
+                                chan.send(ch.encode('utf-8'))
+                        if chan.exit_status_ready():
+                            break
+                        time.sleep(0.01)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    stop = True
+                    try:
+                        chan.close()
+                    except Exception:
+                        pass
+                return chan.recv_exit_status()
+            else:
+                import termios, tty, select as _select
+                fd = sys.stdin.fileno()
+                old_attrs = None
+                try:
+                    if sys.stdin.isatty():
+                        old_attrs = termios.tcgetattr(fd)
+                        tty.setraw(fd)
+                    while True:
+                        rlist, _, _ = _select.select([chan, sys.stdin], [], [])
+                        if chan in rlist:
+                            if chan.recv_ready():
+                                data = chan.recv(32768)
+                                if not data:
+                                    break
+                                sys.stdout.write(data.decode(errors="ignore"))
+                                sys.stdout.flush()
+                            if chan.recv_stderr_ready():
+                                data = chan.recv_stderr(32768)
+                                if not data:
+                                    break
+                                sys.stdout.write(data.decode(errors="ignore"))
+                                sys.stdout.flush()
+                        if sys.stdin in rlist:
+                            try:
+                                data = os.read(fd, 1024)
+                            except Exception:
+                                data = b""
+                            if not data:
+                                break
+                            try:
+                                chan.send(data)
+                            except Exception:
+                                break
+                        if chan.exit_status_ready():
+                            # Drain remaining
+                            while chan.recv_ready():
+                                sys.stdout.write(chan.recv(32768).decode(errors="ignore"))
+                            while chan.recv_stderr_ready():
+                                sys.stdout.write(chan.recv_stderr(32768).decode(errors="ignore"))
+                            sys.stdout.flush()
+                            break
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    try:
+                        if old_attrs is not None:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                    except Exception:
+                        pass
+                    try:
+                        chan.close()
+                    except Exception:
+                        pass
+                return chan.recv_exit_status()
+
+        # Non-PTY mode: stream stdout/stderr
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        while True:
+            if chan.recv_ready():
+                stdout.write(chan.recv(32768))
+            if chan.recv_stderr_ready():
+                stderr.write(chan.recv_stderr(32768))
+            if chan.exit_status_ready():
+                while chan.recv_ready():
+                    stdout.write(chan.recv(32768))
+                while chan.recv_stderr_ready():
+                    stderr.write(chan.recv_stderr(32768))
+                break
+            time.sleep(0.01)
+        out = stdout.getvalue().decode(errors="ignore")
+        err = stderr.getvalue().decode(errors="ignore")
+        if out:
+            sys.stdout.write(out)
+        if err:
+            sys.stderr.write(err)
+        return chan.recv_exit_status()
+    finally:
+        try:
+            cli.close()
+        except Exception:
+            pass
+
+
 def detect_remote_shell(cli: SSHClient) -> str:
     try:
         code, out, _ = cli.run("command -v bash >/dev/null 2>&1 && echo bash || echo sh", timeout=5)
@@ -2479,6 +2629,8 @@ Examples:
   {SCRIPT_NAME} cp ./local.txt pmx:~/uploads
   {SCRIPT_NAME} router-webui router enable
   {SCRIPT_NAME} router-webui --host-alias router disable
+  {SCRIPT_NAME} exec pmx -- htop
+  {SCRIPT_NAME} exec --no-tty pmx -- ls -la /etc
 """
 
 
@@ -2569,6 +2721,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_rwui.add_argument("action", choices=["enable", "disable"], help="Enable or disable the web UI over WAN")
     p_rwui.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
     p_rwui.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
+
+    # Remote command exec (ad-hoc)
+    p_exec = sub.add_parser("exec", help="Run a one-off remote command (supports TTY for TUIs like htop/btop)")
+    p_exec.add_argument("alias", nargs="?")
+    p_exec.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
+    p_exec.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
+    p_exec.add_argument("--tty", dest="tty", action="store_true")
+    p_exec.add_argument("--no-tty", dest="no_tty", action="store_true")
+    # Remainder must not overwrite args.cmd (subparser name), so use a distinct dest
+    p_exec.add_argument("exec_argv", nargs=argparse.REMAINDER, help="Use after -- to pass the remote command and its args")
 
     # File transfer
     p_ls = sub.add_parser("ls-remote")
@@ -2725,7 +2887,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     pass
 
     # Normalize flexible inputs for commands supporting alias options before checks
-    if args.cmd in {"login", "reset-hostkey", "status", "reboot", "list-scripts", "run-scripts", "run-script", "ls-remote", "download", "upload", "router-webui"}:
+    if args.cmd in {"login", "reset-hostkey", "status", "reboot", "list-scripts", "run-scripts", "run-script", "ls-remote", "download", "upload", "router-webui", "exec"}:
         prev_alias = getattr(args, "alias", None)
         if getattr(args, "alias_opt", None):
             args.alias = args.alias_opt
@@ -2783,6 +2945,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return reboot_server(sc, args.wait, alias, extra)
     if args.cmd == "list-scripts":
         return list_scripts(sc, alias)
+    if args.cmd == "exec":
+        if getattr(args, "tty", False):
+            gcfg.force_tty = True
+        if getattr(args, "no_tty", False):
+            gcfg.force_tty = False
+        cmdv = getattr(args, "exec_argv", None) or []
+        if cmdv and cmdv[0] == "--":
+            cmdv = cmdv[1:]
+        return execute_remote_command(sc, alias, cmdv, gcfg.force_tty)
     if args.cmd == "run-scripts":
         set_name = getattr(args, "set", None)
         if not set_name:
