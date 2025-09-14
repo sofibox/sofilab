@@ -1560,7 +1560,7 @@ def _discover_priority_scripts(root: Path) -> List[Path]:
     unnumbered: List[Path] = []
     for p in sorted(root.glob("*.sh")):
         name = p.name
-        m = re.match(r"^(\d{2,})_.*\.sh$", name)
+        m = re.match(r"^(\d+)_.*\.sh$", name)
         if m:
             try:
                 prefix = int(m.group(1))
@@ -1637,7 +1637,7 @@ def run_scripts(sc: ServerConfig, gcfg: GlobalConfig, alias: str, set_name: str,
         for idx, sp in enumerate(scripts, start=1):
             per = _read_args_file(set_dir, sp)
             extra = f" + {' '.join(shlex.quote(x) for x in per)}" if per else ""
-            is_numbered = bool(re.match(r"^\d{2,}_", sp.name))
+            is_numbered = bool(re.match(r"^\d+_", sp.name))
             tag = "" if is_numbered else " (unnumbered)"
             print(f"  [{idx}/{len(scripts)}] {sp.name}{tag}{extra}")
         return 0
@@ -2538,7 +2538,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_runall = sub.add_parser("run-scripts", help="Run an ordered set of scripts from scripts/sets/<name> by numeric prefix")
     p_runall.add_argument("alias", nargs="?", help="Target host alias (positional, or use --host-alias)")
-    p_runall.add_argument("--set", dest="set", required=True, help="Script set name under scripts/sets/<name>")
+    p_runall.add_argument("set_pos", nargs="?", help="Script set name under scripts/sets/<name> (positional)")
+    p_runall.add_argument("--set", dest="set_opt", help="Script set name under scripts/sets/<name> (optional flag)")
     p_runall.add_argument("--host-alias", dest="alias_opt", help="Target host alias")
     p_runall.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_runall.add_argument("--tty", dest="tty", action="store_true")
@@ -2740,6 +2741,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if needs_fix and not prev_alias.startswith('-'):
                     # Treat previous positional alias token as script path
                     args.script = prev_alias
+        if args.cmd == "run-scripts":
+            set_val = getattr(args, "set_opt", None) or getattr(args, "set_pos", None)
+            if set_val is not None:
+                args.set = set_val
 
     # Host-required commands
     if args.cmd == "run-scripts":
@@ -2781,7 +2786,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "run-scripts":
         set_name = getattr(args, "set", None)
         if not set_name:
-            error("Script set name is required: run-scripts <set> --host-alias <alias>")
+            error("Script set name is required: run-scripts <alias> <set> or --set <set>")
             return 1
         common_args = getattr(args, "script_args", None)
         return run_scripts(sc, gcfg, alias, set_name, common_args, getattr(args, "dry_run", False))

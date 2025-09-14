@@ -183,7 +183,7 @@ scripts/sets/proxmox/
 ```
 
 Rules:
-- Numbered scripts (e.g., `10_*.sh`) run first, sorted by numeric prefix
+- Numbered scripts (e.g., `5_*.sh`, `10_*.sh`) run first, sorted by numeric prefix (1+ digits)
 - Unnumbered scripts run afterwards, sorted alphabetically
 
 Run:
