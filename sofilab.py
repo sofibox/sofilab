@@ -995,10 +995,21 @@ def ssh_login(sc: ServerConfig, alias: str) -> int:
             pass
 
 
-def reboot_server(sc: ServerConfig, wait_seconds: Optional[int]) -> int:
+def reboot_server(sc: ServerConfig, wait_seconds: Optional[int], alias: str, hook_args: Optional[List[str]] = None) -> int:
     port = determine_ssh_port(sc.port, sc.host)
     if not port:
         return 1
+
+    # Optional local hook override (scripts/hooks/reboot/scripts/main.* or legacy)
+    if hook_args and len(hook_args) > 0 and hook_args[0] == "--":
+        hook_args = hook_args[1:]
+    hook_rc = _run_local_hook("reboot", sc, alias, port, extra_args=hook_args)
+    if hook_rc is not None:
+        if hook_rc == 0:
+            success("Reboot hook completed successfully")
+        else:
+            error(f"Reboot hook failed with exit code {hook_rc}")
+        return hook_rc
 
     keyfile = get_ssh_keyfile(sc)
     info(f"Issuing reboot on {sc.host}:{port} as {sc.user}")
@@ -2501,6 +2512,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_reboot.add_argument("--host-alias", dest="alias_opt", help="Target host alias; alternative to positional")
     p_reboot.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_reboot.add_argument("--wait", nargs="?", const=180, type=int)
+    # Pass-through args to the reboot hook; use after --
+    p_reboot.add_argument("hook_args", nargs=argparse.REMAINDER, help="Use after -- to pass arguments to the reboot hook")
 
     p_list = sub.add_parser("list-scripts")
     p_list.add_argument("alias", nargs="?")
@@ -2744,7 +2757,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         extra = getattr(args, "hook_args", None)
         return server_status(sc, alias, args.port, extra)
     if args.cmd == "reboot":
-        return reboot_server(sc, args.wait)
+        extra = getattr(args, "hook_args", None)
+        return reboot_server(sc, args.wait, alias, extra)
     if args.cmd == "list-scripts":
         return list_scripts(sc, alias)
     if args.cmd == "run-scripts":

@@ -142,7 +142,7 @@ python sofilab.py login pmx
 
 ## Configuration
 
-The `sofilab.conf` file uses a simple block format:
+The `sofilab.conf` file uses a simple block format (no `scripts=` needed; scripts are now discovered from folders):
 
 ```properties
 [alias1,alias2,alias3]
@@ -153,41 +153,50 @@ port="SSH_PORT"              # Optional, defaults to 22
 keyfile="ssh/alias_key"      # Optional
 ```
 
-### Scripts & Arguments
+### Script Layout (new)
 
-You can run local scripts on remote hosts via `run-script` (one script) or `run-scripts` (all scripts listed for a host). Arguments can be configured in `sofilab.conf` so you don’t need to pass them on the CLI each time.
+You can run local scripts on remote hosts in two ways:
 
-- Inline in `scripts=`: add args after each script name (parsed shell‑style).
-- Per‑script keys: use `script_args.<script>` for long or complex args.
-- Default for all: use `default_script_args` when no per‑script args.
+1) Single scripts under `scripts/main/` (recommended for ad‑hoc):
 
-Examples inside a server block:
-
-```properties
-[pmx]
-host="192.168.50.136"
-user="root"
-keyfile="ssh/pmx_key"
-
-# Inline args (easy):
-scripts="testarg1.sh --name alpha, testarg2.sh 'hello world' 42, testarg3.sh --flag A --path '/etc'"
-
-# Or explicit keys (more verbose):
-# scripts="testarg1.sh, testarg2.sh, testarg3.sh"
-# default_script_args="--non-interactive"
-# script_args.testarg1.sh="--name alpha"
-# script_args.testarg2.sh="'hello world' 42"
-# script_args.testarg3.sh="--flag A --path /etc"
+```text
+scripts/main/update.sh
+scripts/main/tools/net/ping-check.sh
 ```
 
-Precedence when running scripts:
+Run:
 
-- CLI args override config (`--script-args ...` or `-- ...`).
-- Then `script_args.<script>`.
-- Then inline args inside `scripts=`.
-- Then `default_script_args`.
+```bash
+sofilab run-script --host-alias pmx update.sh
+sofilab run-script --host-alias pmx tools/net/ping-check.sh -- --count 5
+```
 
-Your scripts are searched under `scripts/` and uploaded to the remote user’s home at `~/.sofilab_scripts/` for execution, then removed. SofiLab sets useful environment variables for scripts:
+2) Ordered sets under `scripts/sets/<name>/` (priority by number):
+
+```text
+scripts/sets/proxmox/
+  10_update.sh
+  20_secure.sh
+  30_setup-2fa.sh
+  _env                     # optional KEY=VALUE for all scripts
+  _args/20_secure.args     # optional per‑script args
+```
+
+Rules:
+- Numbered scripts (e.g., `10_*.sh`) run first, sorted by numeric prefix
+- Unnumbered scripts run afterwards, sorted alphabetically
+
+Run:
+
+```bash
+# Preview order and args
+sofilab run-scripts --host-alias pmx --set proxmox --dry-run -- --flag1 A --flag2 "B C"
+
+# Execute with common args applied to each
+sofilab run-scripts --host-alias pmx --set proxmox -- --flag1 A --flag2 "B C"
+```
+
+SofiLab uploads scripts to `~/.sofilab_scripts/` on the remote and removes them after execution. During execution, SofiLab sets useful environment variables:
 
 - `SSH_PORT`: configured SSH port for the host
 - `ACTUAL_PORT`: effective port used (after auto‑detection)
@@ -242,12 +251,12 @@ sofilab ls-remote pmx ~
   - `sofilab status --host-alias pmx`
 
 - Run one script (with args):
-  - Positionals + end‑of‑options: `sofilab run-script pmx my.sh -- a "b c" 2`
-  - Named options: `sofilab run-script --host-alias pmx --script my.sh --script-args a "b c" 2`
+  - `sofilab run-script --host-alias pmx update.sh`
+  - `sofilab run-script --host-alias pmx tools/net/ping-check.sh -- --count 3`
 
-- Run all configured scripts (same args applied to each):
-  - `sofilab run-scripts pmx --script-args abc "b c" 123`
-  - `sofilab run-scripts --hostname pmx -- --abc "b c" 123`
+- Run an ordered set (same args applied to each):
+  - `sofilab run-scripts --host-alias pmx --set proxmox`
+  - `sofilab run-scripts --host-alias pmx --set proxmox -- --flag value`
 
 - TTY control (place before `--` if you use it):
   - `--tty` or `--no-tty` with any command that executes scripts.
@@ -265,11 +274,11 @@ Tips:
 
 ### Typical Workflow
 
-- Add a host to `sofilab.conf` with `scripts=` entries.
-- Place your `.sh` files in `scripts/` and make them executable.
-- Verify: `sofilab list-scripts <alias>` and `sofilab status <alias>`.
-- Run all: `sofilab run-scripts <alias>`.
-- Iterate: adjust per‑script args inline or with `script_args.<script>` keys.
+- Add a host to `sofilab.conf`
+- Place single scripts under `scripts/main/`
+- Or create a set under `scripts/sets/<name>/` with numbered scripts
+- Preview: `sofilab run-scripts --host-alias <alias> --set <name> --dry-run`
+- Execute: `sofilab run-scripts --host-alias <alias> --set <name>`
 
 ### Troubleshooting
 
@@ -281,15 +290,27 @@ Tips:
 
 ```text
 sofilab/
-├── README.md             # This documentation
-├── sofilab.py            # Main server management script (Python)
-├── sofilab.conf.sample   # Sample configuration file
-├── TODO.md               # Development notes
-├── .gitignore            # Git ignore rules
-└── ssh/                  # SSH key storage (excluded from git)
-    ├── pmx_key           # Example: Proxmox private key
-    ├── pmx_key.pub       # Example: Proxmox public key
-    └── ...               # Your SSH keys
+├── README.md
+├── sofilab.py
+├── sofilab.conf.sample
+├── scripts/
+│   ├── main/
+│   │   ├── update.sh
+│   │   └── tools/net/ping-check.sh
+│   ├── sets/
+│   │   └── proxmox/
+│   │       ├── 10_update.sh
+│   │       ├── 20_secure.sh
+│   │       ├── 30_setup-2fa.sh
+│   │       ├── _env
+│   │       └── _args/20_secure.args
+│   └── hooks/
+│       ├── login/scripts/main.py
+│       ├── status/scripts/main.py
+│       └── reboot/scripts/main.py
+└── ssh/
+    ├── pmx_key
+    └── pmx_key.pub
 ```
 
 **Note:** The `ssh/` directory and `sofilab.conf` are excluded from git for security.
@@ -338,62 +359,8 @@ To add a new server configuration:
 
 ## Requirements
 
-- macOS or Linux
-- `bash` shell
-- `sshpass` tool for password authentication (optional but recommended)
-  - Install on macOS: `brew install sshpass`
-  - Install on Linux: `apt-get install sshpass` or `yum install sshpass`
+- Python 3.8+
+- Paramiko (auto‑installed by SofiLab when needed)
+- SSH server on the remote hosts
 
-## Roadmap
-
-### Phase 1: SSH Management ✅
-
-- [x] Multi-server SSH connections
-- [x] Alias-based configuration
-- [x] SSH key and password authentication
-- [x] Global installation system
-
-### Phase 2: Server Monitoring (In Progress)
-
-- [ ] Real-time system monitoring (CPU, RAM, disk)
-- [ ] Service status monitoring
-- [ ] Network connectivity checks
-- [ ] Performance metrics collection
-
-### Phase 3: Installation Management (Planned)
-
-- [ ] Package installation automation
-- [ ] Configuration management
-- [ ] Service deployment
-- [ ] Update management
-
-### Phase 4: Advanced Administration (Future)
-
-- [ ] User management tools
-- [ ] Security auditing
-- [ ] Backup automation
-- [ ] Log analysis tools
-
-## Contributing
-
-SofiLab is designed to be simple and extensible. Contributions are welcome!
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Author
-
-**Arafat Ali**  
-Email: [arafat@sofibox.com](mailto:arafat@sofibox.com)  
-GitHub: [@arafatx](https://github.com/arafatx)
-
----
-
-**SofiLab** - Simplifying server management since 2025
+<!-- Roadmap removed intentionally -->
