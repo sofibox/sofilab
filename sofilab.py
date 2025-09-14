@@ -1345,9 +1345,9 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
         error("No remote command provided. Use: sofilab exec <alias> -- <cmd> [args]")
         return 1
 
-    # Build a shell-safe command string executed by /bin/sh -lc
-    shcmd = " ".join(shlex.quote(x) for x in cmd_argv)
-    remote_exec = f"sh -lc {shlex.quote(shcmd)}"
+    # Build a shell-safe command string; let the user's default shell run it.
+    # This avoids forcing /bin/sh, which can source incompatible profile snippets.
+    remote_exec = " ".join(shlex.quote(x) for x in cmd_argv)
 
     try:
         cli = SSHClient(sc.host, port, sc.user, sc.password, get_ssh_keyfile(sc))
