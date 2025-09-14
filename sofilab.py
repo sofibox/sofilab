@@ -847,17 +847,24 @@ def router_webui(sc: ServerConfig, action: str) -> int:
 def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port: int) -> Optional[int]:
     """Try to execute a local hook script for a command.
 
-    Resolution order:
-      1) scripts/<command>.py (cross-platform via current Python)
-      2) Windows: scripts/<command>.ps1 via PowerShell
-      3) POSIX: scripts/<command>.sh via bash/sh
+    Resolution order (new preferred layout first, with legacy fallback):
+      1) scripts/hooks/<command>/hook.py  (cross-platform via current Python)
+      2) scripts/<command>.py            (legacy)
+      3) Windows: scripts/hooks/<command>/hook.ps1 -> scripts/<command>.ps1
+      4) POSIX:  scripts/hooks/<command>/hook.sh  -> scripts/<command>.sh
 
     Returns the exit code if a hook was executed, or None if no hook found.
     """
     scripts_dir = SCRIPT_DIR / "scripts"
-    hook_py = scripts_dir / f"{command_name}.py"
-    hook_ps1 = scripts_dir / f"{command_name}.ps1"
-    hook_sh = scripts_dir / f"{command_name}.sh"
+    hooks_dir = scripts_dir / "hooks" / command_name
+    # Preferred new layout
+    hook_py_new = hooks_dir / "hook.py"
+    hook_ps1_new = hooks_dir / "hook.ps1"
+    hook_sh_new = hooks_dir / "hook.sh"
+    # Legacy flat layout
+    hook_py_legacy = scripts_dir / f"{command_name}.py"
+    hook_ps1_legacy = scripts_dir / f"{command_name}.ps1"
+    hook_sh_legacy = scripts_dir / f"{command_name}.sh"
 
     # Build environment for hooks
     env = os.environ.copy()
@@ -871,20 +878,29 @@ def _run_local_hook(command_name: str, sc: ServerConfig, alias: str, actual_port
     })
 
     try:
-        if hook_py.exists():
-            cmd = [sys.executable, str(hook_py)]
+        # Python hook
+        if hook_py_new.exists():
+            cmd = [sys.executable, str(hook_py_new)]
             return subprocess.call(cmd, env=env)
-        if os.name == 'nt' and hook_ps1.exists():
+        if hook_py_legacy.exists():
+            cmd = [sys.executable, str(hook_py_legacy)]
+            return subprocess.call(cmd, env=env)
+        # Windows PowerShell hook
+        if os.name == 'nt' and (hook_ps1_new.exists() or hook_ps1_legacy.exists()):
             # Prefer pwsh if available, else Windows PowerShell
             pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
-            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(hook_ps1)]
+            ps1_path = str(hook_ps1_new if hook_ps1_new.exists() else hook_ps1_legacy)
+            cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
             return subprocess.call(cmd, env=env)
-        if os.name != 'nt' and hook_sh.exists():
+        # POSIX shell hook
+        if os.name != 'nt' and (hook_sh_new.exists() or hook_sh_legacy.exists()):
             bash = shutil.which("bash")
             if bash:
-                cmd = [bash, str(hook_sh)]
+                sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
+                cmd = [bash, sh_path]
             else:
-                cmd = ["/bin/sh", str(hook_sh)]
+                sh_path = str(hook_sh_new if hook_sh_new.exists() else hook_sh_legacy)
+                cmd = ["/bin/sh", sh_path]
             return subprocess.call(cmd, env=env)
     except FileNotFoundError as e:
         warn(f"Hook interpreter not found: {e}")
