@@ -1332,7 +1332,7 @@ def upload_items(cli: SSHClient, local_paths: List[Path], remote_dest: str, recu
     return any_error
 
 
-def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], force_tty: bool) -> int:
+def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], force_tty: bool, env_kv: Optional[List[str]] = None, workdir: Optional[str] = None) -> int:
     """Run a one-off remote command. If force_tty is True, allocate a PTY and
     bridge I/O for interactive TUIs (htop/btop). Otherwise, stream stdout/stderr
     and return the exit code.
@@ -1341,13 +1341,39 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
     if not port:
         return 1
 
+    # Be forgiving if caller forgot to strip leading "--"; drop any stray isolated "--" tokens
+    while cmd_argv and cmd_argv[0] == "--":
+        cmd_argv = cmd_argv[1:]
+    if cmd_argv:
+        cmd_argv = [x for x in cmd_argv if x != "--"]
+
     if not cmd_argv:
         error("No remote command provided. Use: sofilab exec <alias> -- <cmd> [args]")
         return 1
 
-    # Build a shell-safe command string; let the user's default shell run it.
-    # This avoids forcing /bin/sh, which can source incompatible profile snippets.
-    remote_exec = " ".join(shlex.quote(x) for x in cmd_argv)
+    # Build command with optional env and workdir prefixes; require a shell to interpret.
+    parts: List[str] = []
+    if workdir:
+        parts.append("cd " + shlex.quote(workdir) + " &&")
+    if env_kv:
+        for item in env_kv:
+            # Ignore stray separators or malformed envs
+            if not item or item == "--" or "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            if not k:
+                continue
+            parts.append(f"{k}={shlex.quote(v)}")
+    # Append the actual command argv
+    parts.extend(shlex.quote(x) for x in cmd_argv)
+    composite = " ".join(parts).strip()
+    # Log the fully constructed command for debugging
+    try:
+        log.info("exec composite: %s", composite)
+    except Exception:
+        pass
+
+    # We'll detect the remote shell after connecting and build the final exec string then
 
     try:
         cli = SSHClient(sc.host, port, sc.user, sc.password, get_ssh_keyfile(sc))
@@ -1358,6 +1384,14 @@ def execute_remote_command(sc: ServerConfig, alias: str, cmd_argv: List[str], fo
 
     try:
         assert cli.client is not None
+        # Detect remote shell and construct command; avoid passing any unsupported long options
+        shell_name = detect_remote_shell(cli)
+        remote_exec = f"{shell_name} -c {shlex.quote(composite)}"
+        try:
+            log.info("exec shell: %s", shell_name)
+            log.info("exec remote_exec: %s", remote_exec)
+        except Exception:
+            pass
         chan = cli.client.get_transport().open_session()
         if force_tty:
             chan.get_pty()
@@ -2729,6 +2763,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_exec.add_argument("--hostname", dest="alias_opt", help="Alias (compat)")
     p_exec.add_argument("--tty", dest="tty", action="store_true")
     p_exec.add_argument("--no-tty", dest="no_tty", action="store_true")
+    p_exec.add_argument("--env", dest="env", action="append", help="Environment KEY=VAL (repeatable)")
+    p_exec.add_argument("--workdir", dest="workdir", help="Remote working directory (cd before running)")
     # Remainder must not overwrite args.cmd (subparser name), so use a distinct dest
     p_exec.add_argument("exec_argv", nargs=argparse.REMAINDER, help="Use after -- to pass the remote command and its args")
 
@@ -2951,9 +2987,53 @@ def main(argv: Optional[List[str]] = None) -> int:
         if getattr(args, "no_tty", False):
             gcfg.force_tty = False
         cmdv = getattr(args, "exec_argv", None) or []
+        # Basic trim if parser included a leading '--'
         if cmdv and cmdv[0] == "--":
             cmdv = cmdv[1:]
-        return execute_remote_command(sc, alias, cmdv, gcfg.force_tty)
+        # Salvage known exec options that argparse placed into remainder
+        env_acc: List[str] = list(getattr(args, "env", []) or [])
+        workdir_val: Optional[str] = getattr(args, "workdir", None)
+        tty_set: Optional[bool] = None
+        out_tokens: List[str] = []
+        i = 0
+        while i < len(cmdv):
+            tok = cmdv[i]
+            if tok == "--":
+                i += 1
+                # Remainder after '--' is remote command as-is
+                out_tokens.extend(cmdv[i:])
+                i = len(cmdv)
+                break
+            if tok == "--env":
+                if i + 1 < len(cmdv):
+                    env_acc.append(cmdv[i + 1])
+                    i += 2
+                    continue
+            if tok == "--workdir":
+                if i + 1 < len(cmdv):
+                    workdir_val = cmdv[i + 1]
+                    i += 2
+                    continue
+            if tok == "--tty":
+                tty_set = True
+                i += 1
+                continue
+            if tok == "--no-tty":
+                tty_set = False
+                i += 1
+                continue
+            # Unknown/command token: keep
+            out_tokens.append(tok)
+            i += 1
+        if tty_set is not None:
+            gcfg.force_tty = bool(tty_set)
+        log.info("exec argv (post-trim): %s", repr(cmdv))
+        log.info("exec argv (post-salvage): %s", repr(out_tokens))
+        if env_acc:
+            log.info("exec env: %s", repr(env_acc))
+        if workdir_val:
+            log.info("exec workdir: %s", workdir_val)
+        return execute_remote_command(sc, alias, out_tokens, gcfg.force_tty, env_acc, workdir_val)
     if args.cmd == "run-scripts":
         set_name = getattr(args, "set", None)
         if not set_name:
